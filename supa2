@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+"""Migrate all data from old Supabase to new Supabase"""
+import json, sys, time
+from supabase import create_client
+
+OLD_URL = "https://qiqbfbcxlmsvtyenhwac.supabase.co"
+OLD_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFpcWJmYmN4bG1zdnR5ZW5od2FjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjkyNzkwNjIsImV4cCI6MjA4NDg1NTA2Mn0.2WaMQQTLzh747jQWk1ChAuMJbvpubgnAZir-Vq0GOOE"
+
+NEW_URL = "https://kosmdtcrrklaalfyxmlc.supabase.co"
+NEW_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imtvc21kdGNycmtsYWFsZnl4bWxjIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3OTY0NDc2MywiZXhwIjoyMDk1MjIwNzYzfQ.cpyAuoLRASuypLyG7c37rOi25hAA5QoN-Au5KmWRHp0"
+
+old = create_client(OLD_URL, OLD_KEY)
+new = create_client(NEW_URL, NEW_KEY)
+
+# Tables in order (respecting FK dependencies)
+TABLES = [
+    'notification_settings',
+    'bots',
+    'categories',
+    'products',
+    'subscription_plans',
+    'payment_methods',
+    'payment_order',
+    'bot_languages',
+    'product_payment_method_assignments',
+    'invite_codes',
+    'user_languages',
+    'user_balances',
+    'balance_transactions',
+    'sales',
+    'manual_payments',
+    'coupons',
+    'coupon_redemptions',
+    'user_subscriptions',
+    'balance_transfers',
+]
+
+# Step 1: Export all data
+print("=" * 50)
+print("STEP 1: EXPORTING FROM OLD SUPABASE")
+print("=" * 50)
+exported = {}
+for t in TABLES:
+    try:
+        r = old.table(t).select('*').execute()
+        exported[t] = r.data or []
+        print(f"  ✅ {t}: {len(r.data or [])} rows")
+    except Exception as e:
+        print(f"  ❌ {t}: {e}")
+        exported[t] = []
+
+total = sum(len(v) for v in exported.values())
+print(f"\nTotal exported: {total} rows")
+
+# Save export as backup
+with open('/tmp/supabase_backup.json', 'w') as f:
+    json.dump(exported, f, default=str)
+print("Backup saved to /tmp/supabase_backup.json")
+
+# Step 2: Create tables in new Supabase
+print("\n" + "=" * 50)
+print("STEP 2: CREATING TABLES IN NEW SUPABASE")
+print("=" * 50)
+print("⚠️  You need to run the SQL below in the NEW Supabase dashboard:")
+print("    Go to: https://supabase.com/dashboard/project/kosmdtcrrklaalfyxmlc/sql/new")
+print("    Paste the SQL and click Run")
+print()
+
+SQL = """
+-- Notification Settings
+CREATE TABLE IF NOT EXISTS notification_settings (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    notify_1day_before boolean DEFAULT true,
+    notify_1hour_before boolean DEFAULT true,
+    notify_15min_before boolean DEFAULT true,
+    created_at timestamptz DEFAULT now()
+);
+
+-- Bots
+CREATE TABLE IF NOT EXISTS bots (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    bot_token text NOT NULL,
+    bot_username text NOT NULL,
+    bot_name text,
+    is_active boolean DEFAULT true,
+    stars_bot_token text,
+    stars_bot_username text,
+    link_generator_bot_token text,
+    link_generator_bot_username text,
+    support_username text,
+    welcome_message text,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now()
+);
+
+-- Categories
+CREATE TABLE IF NOT EXISTS categories (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    bot_id uuid REFERENCES bots(id),
+    name text NOT NULL,
+    display_order integer DEFAULT 0,
+    is_active boolean DEFAULT true,
+    created_at timestamptz DEFAULT now()
+);
+
+-- Products
+CREATE TABLE IF NOT EXISTS products (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    bot_id uuid REFERENCES bots(id),
+    category_id uuid REFERENCES categories(id),
+    product_name text NOT NULL,
+    product_description text,
+    price numeric DEFAULT 0,
+    currency text DEFAULT 'USD',
+    is_active boolean DEFAULT true,
+    display_order integer DEFAULT 0,
+    enable_hotmart boolean DEFAULT false,
+    enable_crypto boolean DEFAULT false,
+    enable_telegram_stars boolean DEFAULT false,
+    enable_manual boolean DEFAULT false,
+    hotmart_payment_url text,
+    hotmart_product_id text,
+    telegram_stars_price integer,
+    crypto_price_usd numeric,
+    channel_chat_id text,
+    access_link text,
+    invite_link text,
+    exclude_from_coupons boolean DEFAULT false,
+    stars_bot_token text,
+    stars_bot_username text,
+    link_generator_bot_token text,
+    link_generator_bot_username text,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now()
+);
+
+-- Subscription Plans
+CREATE TABLE IF NOT EXISTS subscription_plans (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    product_id uuid REFERENCES products(id),
+    plan_name text NOT NULL,
+    price numeric DEFAULT 0,
+    duration_minutes integer DEFAULT 0,
+    telegram_stars_price integer,
+    crypto_price_usd numeric,
+    hotmart_checkout_url text,
+    is_enabled boolean DEFAULT true,
+    created_at timestamptz DEFAULT now()
+);
+
+-- Payment Methods
+CREATE TABLE IF NOT EXISTS payment_methods (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    name text NOT NULL,
+    payment_details text,
+    payment_url text,
+    require_email boolean DEFAULT false,
+    require_transaction_id boolean DEFAULT false,
+    require_code boolean DEFAULT false,
+    require_random_note boolean DEFAULT false,
+    exclude_from_coupons boolean DEFAULT false,
+    is_active boolean DEFAULT true,
+    created_at timestamptz DEFAULT now()
+);
+
+-- Payment Order
+CREATE TABLE IF NOT EXISTS payment_order (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    method_key text NOT NULL,
+    display_order integer DEFAULT 0
+);
+
+-- Bot Languages
+CREATE TABLE IF NOT EXISTS bot_languages (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    bot_id uuid REFERENCES bots(id),
+    language_code text NOT NULL,
+    display_order integer DEFAULT 0
+);
+
+-- Product Payment Method Assignments
+CREATE TABLE IF NOT EXISTS product_payment_method_assignments (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    payment_method_id uuid REFERENCES payment_methods(id),
+    product_id uuid,
+    bot_id uuid,
+    is_enabled boolean DEFAULT true,
+    created_at timestamptz DEFAULT now()
+);
+
+-- Invite Codes
+CREATE TABLE IF NOT EXISTS invite_codes (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    product_id uuid REFERENCES products(id),
+    code text NOT NULL,
+    is_used boolean DEFAULT false,
+    used_by_telegram_user_id bigint,
+    used_at timestamptz,
+    created_at timestamptz DEFAULT now()
+);
+
+-- User Languages
+CREATE TABLE IF NOT EXISTS user_languages (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    telegram_user_id bigint NOT NULL,
+    bot_id uuid REFERENCES bots(id),
+    language_code text DEFAULT 'en',
+    created_at timestamptz DEFAULT now(),
+    UNIQUE(telegram_user_id, bot_id)
+);
+
+-- User Balances
+CREATE TABLE IF NOT EXISTS user_balances (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    telegram_user_id bigint NOT NULL,
+    bot_id uuid REFERENCES bots(id),
+    balance numeric DEFAULT 0,
+    currency text DEFAULT 'USD',
+    updated_at timestamptz DEFAULT now(),
+    UNIQUE(telegram_user_id, bot_id)
+);
+
+-- Balance Transactions
+CREATE TABLE IF NOT EXISTS balance_transactions (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    telegram_user_id bigint NOT NULL,
+    bot_id uuid REFERENCES bots(id),
+    amount numeric NOT NULL,
+    type text NOT NULL CHECK (type IN ('recharge', 'purchase', 'admin_add', 'admin_remove', 'refund', 'transfer_in', 'transfer_out')),
+    reference text,
+    description text,
+    admin_note text,
+    created_at timestamptz DEFAULT now()
+);
+
+-- Sales
+CREATE TABLE IF NOT EXISTS sales (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    bot_id uuid REFERENCES bots(id),
+    product_id uuid REFERENCES products(id),
+    telegram_user_id bigint NOT NULL,
+    telegram_username text,
+    hotmart_transaction_id text,
+    payment_method text,
+    amount numeric DEFAULT 0,
+    status text DEFAULT 'completed',
+    created_at timestamptz DEFAULT now()
+);
+
+-- Manual Payments
+CREATE TABLE IF NOT EXISTS manual_payments (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    product_id uuid REFERENCES products(id),
+    plan_id uuid,
+    telegram_user_id bigint NOT NULL,
+    telegram_username text,
+    email text,
+    transaction_id text,
+    payment_proof_url text,
+    status text DEFAULT 'pending',
+    created_at timestamptz DEFAULT now()
+);
+
+-- Coupons
+CREATE TABLE IF NOT EXISTS coupons (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    bot_id uuid REFERENCES bots(id),
+    code text NOT NULL,
+    discount_type text DEFAULT 'percentage',
+    discount_value numeric DEFAULT 0,
+    max_uses integer,
+    used_count integer DEFAULT 0,
+    applies_to_paypal boolean DEFAULT true,
+    applies_to_crypto boolean DEFAULT true,
+    applies_to_stars boolean DEFAULT true,
+    is_active boolean DEFAULT true,
+    expires_at timestamptz,
+    created_at timestamptz DEFAULT now()
+);
+
+-- Coupon Redemptions
+CREATE TABLE IF NOT EXISTS coupon_redemptions (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    coupon_id uuid REFERENCES coupons(id),
+    telegram_user_id bigint NOT NULL,
+    bot_id uuid REFERENCES bots(id),
+    sale_reference text,
+    redeemed_at timestamptz DEFAULT now()
+);
+
+-- User Subscriptions
+CREATE TABLE IF NOT EXISTS user_subscriptions (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    telegram_user_id bigint NOT NULL,
+    telegram_username text,
+    product_id uuid REFERENCES products(id),
+    bot_id uuid REFERENCES bots(id),
+    plan_id uuid,
+    invite_link text,
+    expires_at timestamptz,
+    status text DEFAULT 'active',
+    kicked_at timestamptz,
+    notified_1day boolean DEFAULT false,
+    notified_1hour boolean DEFAULT false,
+    notified_15min boolean DEFAULT false,
+    created_at timestamptz DEFAULT now()
+);
+
+-- Balance Transfers
+CREATE TABLE IF NOT EXISTS balance_transfers (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    from_user_id bigint NOT NULL,
+    to_user_id bigint NOT NULL,
+    bot_id uuid REFERENCES bots(id),
+    amount numeric NOT NULL,
+    status text DEFAULT 'pending',
+    requested_at timestamptz DEFAULT now(),
+    resolved_at timestamptz,
+    admin_note text
+);
+
+-- Disable RLS on all tables for now
+ALTER TABLE notification_settings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bots ENABLE ROW LEVEL SECURITY;
+ALTER TABLE categories ENABLE ROW LEVEL SECURITY;
+ALTER TABLE products ENABLE ROW LEVEL SECURITY;
+ALTER TABLE subscription_plans ENABLE ROW LEVEL SECURITY;
+ALTER TABLE payment_methods ENABLE ROW LEVEL SECURITY;
+ALTER TABLE payment_order ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bot_languages ENABLE ROW LEVEL SECURITY;
+ALTER TABLE product_payment_method_assignments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE invite_codes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE user_languages ENABLE ROW LEVEL SECURITY;
+ALTER TABLE user_balances ENABLE ROW LEVEL SECURITY;
+ALTER TABLE balance_transactions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sales ENABLE ROW LEVEL SECURITY;
+ALTER TABLE manual_payments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE coupons ENABLE ROW LEVEL SECURITY;
+ALTER TABLE coupon_redemptions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE user_subscriptions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE balance_transfers ENABLE ROW LEVEL SECURITY;
+
+-- Allow full access with anon key (same as Lovable setup)
+CREATE POLICY "Allow all" ON notification_settings FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow all" ON bots FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow all" ON categories FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow all" ON products FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow all" ON subscription_plans FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow all" ON payment_methods FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow all" ON payment_order FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow all" ON bot_languages FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow all" ON product_payment_method_assignments FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow all" ON invite_codes FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow all" ON user_languages FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow all" ON user_balances FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow all" ON balance_transactions FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow all" ON sales FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow all" ON manual_payments FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow all" ON coupons FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow all" ON coupon_redemptions FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow all" ON user_subscriptions FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow all" ON balance_transfers FOR ALL USING (true) WITH CHECK (true);
+"""
+
+with open('/tmp/create_tables.sql', 'w') as f:
+    f.write(SQL)
+print("SQL saved to /tmp/create_tables.sql")
+print("⚠️  Go to https://supabase.com/dashboard/project/kosmdtcrrklaalfyxmlc/sql/new")
+print("    Paste the contents of /tmp/create_tables.sql and click Run")
+print()
+
+input("Press ENTER after you've run the SQL in the Supabase dashboard...")
+
+# Step 3: Import data
+print("\n" + "=" * 50)
+print("STEP 3: IMPORTING DATA TO NEW SUPABASE")
+print("=" * 50)
+
+for t in TABLES:
+    data = exported.get(t, [])
+    if not data:
+        print(f"  ⏭️  {t}: empty, skipping")
+        continue
+    
+    # Insert in batches of 50
+    success = 0
+    failed = 0
+    for i in range(0, len(data), 50):
+        batch = data[i:i+50]
+        try:
+            new.table(t).upsert(batch).execute()
+            success += len(batch)
+        except Exception as e:
+            # Try one by one
+            for row in batch:
+                try:
+                    new.table(t).upsert(row).execute()
+                    success += 1
+                except Exception as e2:
+                    failed += 1
+                    if failed <= 3:
+                        print(f"    ⚠️  {t} row error: {str(e2)[:100]}")
+    
+    print(f"  ✅ {t}: {success} imported, {failed} failed")
+    time.sleep(0.2)
+
+print("\n" + "=" * 50)
+print("MIGRATION COMPLETE!")
+print("=" * 50)
+print(f"\nNow update your bot code:")
+print(f'  SUPABASE_URL = "{NEW_URL}"')
+print(f'  SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imtvc21kdGNycmtsYWFsZnl4bWxjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk2NDQ3NjMsImV4cCI6MjA5NTIyMDc2M30.ysSsMVA3nmhqKbl-Vwu63WN1qKjw0InE2mRC5uBkjT8"')
+print(f"\nThen restart: supervisorctl restart bot-manager")
