@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""Retry import - strips unknown columns automatically"""
+import json, time
+from supabase import create_client
+
+NEW_URL = "https://kosmdtcrrklaalfyxmlc.supabase.co"
+NEW_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imtvc21kdGNycmtsYWFsZnl4bWxjIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3OTY0NDc2MywiZXhwIjoyMDk1MjIwNzYzfQ.cpyAuoLRASuypLyG7c37rOi25hAA5QoN-Au5KmWRHp0"
+
+new = create_client(NEW_URL, NEW_KEY)
+
+# Load exported data
+with open('/tmp/supabase_backup.json', 'r') as f:
+    exported = json.load(f)
+
+TABLES = [
+    'notification_settings', 'bots', 'categories', 'products',
+    'subscription_plans', 'payment_methods', 'payment_order',
+    'bot_languages', 'product_payment_method_assignments',
+    'invite_codes', 'user_languages', 'user_balances',
+    'balance_transactions', 'sales', 'manual_payments',
+    'coupons', 'coupon_redemptions', 'user_subscriptions',
+    'balance_transfers',
+]
+
+print("IMPORTING DATA TO NEW SUPABASE")
+print("=" * 50)
+
+for t in TABLES:
+    data = exported.get(t, [])
+    if not data:
+        print(f"  ⏭️  {t}: empty")
+        continue
+    
+    success = 0
+    failed = 0
+    bad_cols = set()
+    
+    for row in data:
+        # Remove known bad columns from previous attempts
+        for bc in list(bad_cols):
+            row.pop(bc, None)
+        
+        retries = 3
+        while retries > 0:
+            try:
+                new.table(t).upsert(row).execute()
+                success += 1
+                break
+            except Exception as e:
+                err = str(e)
+                # If column not found, remove it and retry
+                if "Could not find the" in err and "column" in err:
+                    # Extract column name
+                    col = err.split("'")[1] if "'" in err else ""
+                    if col:
+                        bad_cols.add(col)
+                        row.pop(col, None)
+                        retries -= 1
+                        continue
+                # FK violation - skip
+                elif "violates foreign key" in err:
+                    failed += 1
+                    break
+                else:
+                    failed += 1
+                    if failed <= 2:
+                        print(f"    ⚠️  {t}: {err[:120]}")
+                    break
+    
+    if bad_cols:
+        print(f"  ✅ {t}: {success} imported, {failed} failed (stripped cols: {bad_cols})")
+    else:
+        print(f"  ✅ {t}: {success} imported, {failed} failed")
+    time.sleep(0.2)
+
+print("\n✅ MIGRATION COMPLETE!")
