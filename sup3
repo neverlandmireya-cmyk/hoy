@@ -1,0 +1,35 @@
+El problema es que la vieja base tiene columnas extra que no puse en las tablas nuevas. Lo arreglo:
+
+Sigue estos pasos:
+
+Paso 1: Abre https://supabase.com/dashboard/project/kosmdtcrrklaalfyxmlc/sql/new y pega el contenido de fix_columns.sql → Click Run
+
+Paso 2: Sube migrate_retry.py al VPS:
+
+nano /opt/bot-manager/migrate_retry.py
+
+
+Pega el contenido, guarda, y corre:
+
+/opt/bot-manager/venv/bin/python3 /opt/bot-manager/migrate_retry.py
+
+
+Este script es inteligente — si encuentra una columna que no existe, la quita automáticamente y reintenta. No falla.
+
+Paso 3: Cuando termine, actualiza el bot:
+
+nano /opt/bot-manager/bot_manager.py
+
+
+Cambia las 2 líneas:
+
+SUPABASE_URL = "https://kosmdtcrrklaalfyxmlc.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imtvc21kdGNycmtsYWFsZnl4bWxjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk2NDQ3NjMsImV4cCI6MjA5NTIyMDc2M30.ysSsMVA3nmhqKbl-Vwu63WN1qKjw0InE2mRC5uBkjT8"
+
+
+Paso 4: Reinicia:
+
+supervisorctl restart bot-manager
+
+
+Mándame lo que sale el migrate_retry.
