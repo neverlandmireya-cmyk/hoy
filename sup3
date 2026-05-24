@@ -1,13 +1,14 @@
-cd /tmp/hello-world-hug-1655
-
-# Actualizar .env con nuevo Supabase
-cat > .env << 'EOF'
-VITE_SUPABASE_PROJECT_ID="kosmdtcrrklaalfyxmlc"
-VITE_SUPABASE_PUBLISHABLE_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imtvc21kdGNycmtsYWFsZnl4bWxjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk2NDQ3NjMsImV4cCI6MjA5NTIyMDc2M30.ysSsMVA3nmhqKbl-Vwu63WN1qKjw0InE2mRC5uBkjT8"
-VITE_SUPABASE_URL="https://kosmdtcrrklaalfyxmlc.supabase.co"
-EOF
-
-# Push a GitHub
-git add .env
-git commit -m "Update Supabase credentials"
-git push origin main
+CREATE TABLE IF NOT EXISTS app_settings (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), key text, value text, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now());
+CREATE TABLE IF NOT EXISTS banned_users (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), telegram_user_id bigint, bot_id uuid, banned_at timestamptz DEFAULT now(), reason text);
+CREATE TABLE IF NOT EXISTS bot_translations (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), bot_id uuid, language_code text, key text, value text, created_at timestamptz DEFAULT now());
+CREATE TABLE IF NOT EXISTS coupon_activations (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), coupon_id uuid, telegram_user_id bigint, bot_id uuid, sale_reference text, activated_at timestamptz DEFAULT now(), redeemed_at timestamptz DEFAULT now(), created_at timestamptz DEFAULT now());
+CREATE TABLE IF NOT EXISTS generator_bots (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), bot_token text, bot_username text, bot_name text, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now());
+CREATE TABLE IF NOT EXISTS gifts (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), bot_id uuid, product_id uuid, telegram_user_id bigint, telegram_username text, invite_link text, invite_code text, created_at timestamptz DEFAULT now());
+CREATE TABLE IF NOT EXISTS link_generation_logs (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), bot_id uuid, channel_id text, invite_link text, member_limit integer, created_at timestamptz DEFAULT now());
+CREATE TABLE IF NOT EXISTS manual_payment_methods (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), name text, payment_details text, payment_url text, require_email boolean DEFAULT false, require_transaction_id boolean DEFAULT false, require_code boolean DEFAULT false, require_random_note boolean DEFAULT false, exclude_from_coupons boolean DEFAULT false, is_active boolean DEFAULT true, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now());
+CREATE TABLE IF NOT EXISTS payment_method_assignments (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), payment_method_id uuid, product_id uuid, bot_id uuid, is_enabled boolean DEFAULT true, created_at timestamptz DEFAULT now());
+CREATE TABLE IF NOT EXISTS pending_purchases (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), bot_id uuid, product_id uuid, plan_id uuid, telegram_user_id bigint, telegram_username text, payment_method text, amount numeric, status text DEFAULT 'pending', transaction_id text, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now());
+CREATE TABLE IF NOT EXISTS subscriptions (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), telegram_user_id bigint, product_id uuid, bot_id uuid, plan_id uuid, status text DEFAULT 'active', created_at timestamptz DEFAULT now(), expires_at timestamptz);
+CREATE TABLE IF NOT EXISTS user_active_coupons (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), telegram_user_id bigint, bot_id uuid, coupon_id uuid, activated_at timestamptz DEFAULT now(), created_at timestamptz DEFAULT now());
+CREATE TABLE IF NOT EXISTS webhook_logs (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), source text, payload jsonb, status text, created_at timestamptz DEFAULT now());
+CREATE OR REPLACE VIEW user_languages AS SELECT * FROM user_language_preferences;
