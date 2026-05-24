@@ -1,0 +1,3213 @@
+import os, asyncio, logging, aiohttp, urllib.parse, json, re, time, random
+from datetime import datetime, timedelta
+from typing import Dict, Optional, List
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply, LabeledPrice, Bot, ReplyKeyboardRemove
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler, PreCheckoutQueryHandler
+from supabase import create_client, Client
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+from threading import Thread
+
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+SUPABASE_URL = "https://qiqbfbcxlmsvtyenhwac.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFpcWJmYmN4bG1zdnR5ZW5od2FjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjkyNzkwNjIsImV4cCI6MjA4NDg1NTA2Mn0.2WaMQQTLzh747jQWk1ChAuMJbvpubgnAZir-Vq0GOOE"
+OXAPAY_MERCHANT_KEY = "JXFYYO-FKAPJ8-H214TJ-HFEBVZ"
+OXAPAY_API_URL = "https://api.oxapay.com/v1/payment/invoice"
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+active_bots: Dict[str, Application] = {}
+link_gen_bots: Dict[str, Bot] = {}  # bot_id -> Bot for link generation
+stars_bots: Dict[str, Application] = {}  # stars_bot_username -> Application
+stars_to_main: Dict[str, str] = {}  # stars_bot_username -> main_bot_username
+
+WAITING_EMAIL, WAITING_TRANSACTION, WAITING_CODE, WAITING_PROOF = range(4)
+
+cached_payment_order = None
+cached_payment_order_time = None
+cached_bot_languages = {}
+cached_bot_languages_time = {}
+cached_manual_methods = None
+cached_manual_methods_time = None
+cached_assignments = None
+cached_assignments_time = None
+cached_notif_settings = None
+cached_notif_settings_time = None
+
+app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+LANGUAGE_FLAGS = {'en': '🇺🇸 English', 'es': '🇪🇸 Español', 'pt': '🇧🇷 Português', 'fr': '🇫🇷 Français'}
+
+DEFAULT_TRANSLATIONS = {
+    'en': {
+        'welcome_message': 'Welcome! Select a product below.',
+        'purchase_message': 'Thanks for your purchase!\n\nHere is your access: {invite_link}\n\nWelcome!',
+        'subscription_message': 'Thanks for your purchase!\n\nPlan: {plan_name}\nExpires: {expires}\n\nYour access: {invite_link}',
+        'permanent': 'Permanent (never expires)',
+        'select_plan': 'Choose your plan below to get started:',
+        'full_access': 'Full access',
+        'price_label': 'Price:',
+        'duration_label': 'Duration:',
+        'forever': 'Forever',
+        'myaccess_title': '🎟 Your Purchases',
+        'myaccess_empty': 'You don\'t have any purchases yet.',
+        'myaccess_product': 'Product:',
+        'myaccess_plan': 'Plan:',
+        'myaccess_expires': 'Expires:',
+        'myaccess_status': 'Status:',
+        'myaccess_link': 'Access:',
+        'myaccess_status_active': '✅ Active',
+        'myaccess_status_expired': '❌ Expired',
+        'myaccess_status_permanent': '♾ Permanent',
+        'coupon_prompt': '🎟 Send me the coupon code:\n\nSend /cancel to cancel.',
+        'coupon_invalid': '❌ Invalid coupon code.',
+        'coupon_expired': '❌ This coupon has expired.',
+        'coupon_max_uses': '❌ This coupon has reached its usage limit.',
+        'coupon_activated': '✅ Coupon activated! Discount will apply at checkout for PayPal, Crypto, and Stars.',
+        'coupon_applied': 'Coupon applied:',
+        'original_price': 'Original:',
+        'final_price': 'You pay:',
+        'balance_title': '💰 Your Balance',
+        'balance_current': 'Current balance:',
+        'balance_recharge_prompt': 'Send the amount you want to add (in USD), e.g. 10:\n\nSend /cancel to cancel.',
+        'balance_invalid_amount': '❌ Invalid amount. Send a positive number.',
+        'balance_insufficient': '❌ Insufficient balance. You have $${current}, need $${needed} more. Use /recharge to add funds.',
+        'balance_recharged': '✅ Balance recharged. New balance: ${balance}',
+        'balance_paid': '✅ Paid with balance. New balance: ${balance}',
+        'balance_confirm': 'Confirm purchase with balance',
+        'balance_after': 'Balance after:',
+        'confirm_yes': '✅ Confirm',
+        'confirm_no': '❌ Cancel',
+        'purchase_cancelled': 'Purchase cancelled.', 'back': 'Back',
+        'refund_notification': 'You have been refunded ${amount}. New balance: ${balance}.',
+        'transfer_prompt_amount': 'How much do you want to transfer? Send the amount:\n\nSend /cancel to cancel.',
+        'transfer_prompt_id': 'Send the Telegram User ID of the recipient.\n\nTip: the recipient can find their ID by sending /myid to this bot.\n\nSend /cancel to cancel.',
+        'transfer_invalid_id': 'Invalid User ID. Send a number.',
+        'transfer_self': 'You cannot transfer to yourself.',
+        'transfer_insufficient': 'Insufficient balance.',
+        'transfer_pending': 'Transfer request sent. Waiting for admin approval.\n\nAmount: ${amount}\nTo: {to_id}',
+        'transfer_approved': 'Your transfer of ${amount} has been approved. New balance: ${balance}.',
+        'transfer_received': 'You received ${amount}. Your balance: ${balance}.',
+        'transfer_rejected': 'Your transfer of ${amount} was rejected.',
+        'your_id_is': 'Your Telegram ID is:',
+        'pay_with_balance_btn': 'Pay with Balance',
+        'recharge_balance_btn': '💰 Recharge Balance',
+        'hotmart_no_coupon': '⚠️ Coupons do not apply to card payments.',
+        'no_products': 'No products available at the moment.',
+        'already_purchased': 'You have already purchased this product.',
+        'no_refunds': 'This is a digital product. No refunds are available after purchase.',
+        'crypto_payment_title': '💎 **Crypto Payment**',
+        'crypto_product': 'Product:', 'crypto_amount': 'Amount:',
+        'crypto_payment_info': 'Click the button below to pay with USDT, BTC, ETH, and more.',
+        'crypto_after_payment': 'After payment, your access will be delivered automatically.',
+        'crypto_error': 'Error creating crypto invoice. Please try again or contact support.', 'crypto_minimum': 'Minimum amount for crypto is $0.10 USD.', 'sub_expiring': '⏰ Your subscription to ${product} has ${time} remaining.', 'sub_expiring_soon': '⚠️ Your subscription to ${product} expires in ${time}!', 'sub_expired': '❌ Your subscription to ${product} has expired. You can purchase again anytime!', 'reportbug_ask': 'Describe the bug or issue (text only):\n\nSend /cancel to cancel.', 'reportbug_sent': '✅ Bug report sent. Thank you!', 'reportbug_empty': 'Please describe the bug.', 'cancelled': '❌ Cancelled.',
+        'crypto_not_configured': 'Crypto price not configured.',
+        'stars_not_configured': 'Stars price not configured.',
+        'product_not_found': 'Product not found.', 'bot_not_found': 'Bot configuration not found.',
+        'support_message': 'For Support:',
+        'important_exact': '⚠️ **Important:** Please send exactly **${price} {currency}**',
+        'after_payment_proof': 'After making the payment, click the button below to submit your proof:', 'paypal_note': 'Note',
+        'send_email': '📧 Please send your email address:\n\nSend /cancel to cancel.',
+        'invalid_email': '❌ Invalid email. Please send a valid one (e.g., example@gmail.com):',
+        'send_transaction': '🔢 Please send your Transaction ID or reference number:\n\nSend /cancel to cancel.',
+        'send_code': '🔑 Please send your gift card code:\n\nSend /cancel to cancel.',
+        'send_proof': '📎 Please send your payment proof (screenshot or document):\n\nSend /cancel to cancel.',
+        'invalid_proof': '❌ Please send an image or document as proof.',
+        'proof_submitted': '✅ Payment proof submitted!\n\nYour payment is under review.',
+        'proof_error': '❌ Error submitting proof. Please try again.',
+        'invite_error': 'Payment received but could not generate invite link. Please contact support.',
+        'already_access': 'You already have access to this product.',
+        'language_changed': '✅ Language changed!',
+        'pay_cards': '💳 Pay with Cards & Local Payment',
+        'pay_stars': 'Pay with Stars', 'pay_crypto': 'Pay with Crypto',
+        'pay_already': '✅ I Already Paid', 'pay_link': '🔗 Pay Here',
+    },
+    'es': {
+        'welcome_message': '¡Bienvenido! Selecciona un producto abajo.',
+        'purchase_message': '¡Gracias por tu compra!\n\nAquí está tu acceso: {invite_link}\n\n¡Bienvenido!',
+        'subscription_message': '¡Gracias por tu compra!\n\nPlan: {plan_name}\nExpira: {expires}\n\nTu acceso: {invite_link}',
+        'permanent': 'Permanente (nunca expira)',
+        'select_plan': 'Elige tu plan abajo para comenzar:',
+        'full_access': 'Acceso completo',
+        'price_label': 'Precio:',
+        'duration_label': 'Duración:',
+        'forever': 'Para siempre',
+        'myaccess_title': '🎟 Tus Compras',
+        'myaccess_empty': 'Aún no tienes compras.',
+        'myaccess_product': 'Producto:',
+        'myaccess_plan': 'Plan:',
+        'myaccess_expires': 'Expira:',
+        'myaccess_status': 'Estado:',
+        'myaccess_link': 'Acceso:',
+        'myaccess_status_active': '✅ Activo',
+        'myaccess_status_expired': '❌ Expirado',
+        'myaccess_status_permanent': '♾ Permanente',
+        'coupon_prompt': '🎟 Envíame el código del cupón:\n\nEnvía /cancel para cancelar.',
+        'coupon_invalid': '❌ Código de cupón inválido.',
+        'coupon_expired': '❌ Este cupón ha expirado.',
+        'coupon_max_uses': '❌ Este cupón alcanzó su límite de uso.',
+        'coupon_activated': '✅ ¡Cupón activado! El descuento aplicará al pagar con PayPal, Crypto o Stars.',
+        'coupon_applied': 'Cupón aplicado:',
+        'original_price': 'Original:',
+        'final_price': 'Tu pagas:',
+        'balance_title': '💰 Tu Saldo',
+        'balance_current': 'Saldo actual:',
+        'balance_recharge_prompt': 'Envía el monto que quieres agregar (en USD), ej: 10:\n\nEnvía /cancel para cancelar.',
+        'balance_invalid_amount': '❌ Monto inválido. Envía un número positivo.',
+        'balance_insufficient': '❌ Saldo insuficiente. Tienes $${current}, te faltan $${needed}. Usa /recharge para agregar fondos.',
+        'balance_recharged': '✅ Saldo recargado. Nuevo saldo: ${balance}',
+        'balance_paid': '✅ Pagado con saldo. Nuevo saldo: ${balance}',
+        'balance_confirm': 'Confirmar compra con saldo',
+        'balance_after': 'Saldo después:',
+        'confirm_yes': '✅ Confirmar',
+        'confirm_no': '❌ Cancelar',
+        'purchase_cancelled': 'Compra cancelada.', 'back': 'Volver',
+        'refund_notification': 'Se te ha reembolsado ${amount}. Nuevo saldo: ${balance}.',
+        'transfer_prompt_amount': 'Cuanto quieres transferir? Envia el monto:\n\nEnvía /cancel para cancelar.',
+        'transfer_prompt_id': 'Envia el ID de Telegram del destinatario.\n\nTip: el destinatario puede ver su ID enviando /myid a este bot.\n\nEnvía /cancel para cancelar.',
+        'transfer_invalid_id': 'ID invalido. Envia un numero.',
+        'transfer_self': 'No puedes transferirte a ti mismo.',
+        'transfer_insufficient': 'Saldo insuficiente.',
+        'transfer_pending': 'Solicitud de transferencia enviada. Esperando aprobacion del admin.\n\nMonto: ${amount}\nPara: {to_id}',
+        'transfer_approved': 'Tu transferencia de ${amount} fue aprobada. Nuevo saldo: ${balance}.',
+        'transfer_received': 'Recibiste ${amount}. Tu saldo: ${balance}.',
+        'transfer_rejected': 'Tu transferencia de ${amount} fue rechazada.',
+        'your_id_is': 'Tu ID de Telegram es:',
+        'pay_with_balance_btn': 'Pagar con Saldo',
+        'recharge_balance_btn': '💰 Recargar Saldo',
+        'hotmart_no_coupon': '⚠️ Los cupones no aplican para pagos con tarjeta.',
+        'no_products': 'No hay productos disponibles.',
+        'already_purchased': 'Ya has comprado este producto.',
+        'no_refunds': 'Este es un producto digital. No hay reembolsos disponibles después de la compra.',
+        'crypto_payment_title': '💎 **Pago con Crypto**',
+        'crypto_product': 'Producto:', 'crypto_amount': 'Monto:',
+        'crypto_payment_info': 'Haz clic en el botón para pagar con USDT, BTC, ETH y más.',
+        'crypto_after_payment': 'Después del pago, tu acceso será entregado automáticamente.',
+        'crypto_error': 'Error al crear factura crypto. Intenta de nuevo o contacta soporte.', 'crypto_minimum': 'El monto mínimo para crypto es $0.10 USD.', 'sub_expiring': '⏰ Tu suscripción a ${product} tiene ${time} restante.', 'sub_expiring_soon': '⚠️ Tu suscripción a ${product} expira en ${time}!', 'sub_expired': '❌ Tu suscripción a ${product} ha expirado. ¡Puedes comprar de nuevo cuando quieras!', 'reportbug_ask': 'Describe el bug o problema (solo texto):\n\nEnvía /cancel para cancelar.', 'reportbug_sent': '✅ Reporte de bug enviado. ¡Gracias!', 'reportbug_empty': 'Por favor describe el bug.', 'cancelled': '❌ Cancelado.',
+        'crypto_not_configured': 'Precio crypto no configurado.',
+        'stars_not_configured': 'Precio de Stars no configurado.',
+        'product_not_found': 'Producto no encontrado.', 'bot_not_found': 'Bot no encontrado.',
+        'support_message': 'Para soporte:',
+        'important_exact': '⚠️ **Importante:** Envía exactamente **${price} {currency}**',
+        'after_payment_proof': 'Después de pagar, haz clic para enviar tu comprobante:', 'paypal_note': 'Nota',
+        'send_email': '📧 Envía tu correo electrónico:\n\nEnvía /cancel para cancelar.',
+        'invalid_email': '❌ Email inválido. Envía uno válido (ej: ejemplo@gmail.com):',
+        'send_transaction': '🔢 Envía tu ID de transacción:\n\nEnvía /cancel para cancelar.',
+        'send_code': '🔑 Envía el código de tu tarjeta de regalo:\n\nEnvía /cancel para cancelar.',
+        'send_proof': '📎 Envía tu comprobante de pago (captura o documento):\n\nEnvía /cancel para cancelar.',
+        'invalid_proof': '❌ Envía una imagen o documento.',
+        'proof_submitted': '✅ ¡Comprobante enviado!\n\nTu pago está en revisión.',
+        'proof_error': '❌ Error al enviar comprobante. Intenta de nuevo.',
+        'invite_error': 'Pago recibido pero no se pudo generar link. Contacta soporte.',
+        'already_access': 'Ya tienes acceso a este producto.',
+        'language_changed': '✅ ¡Idioma cambiado!',
+        'pay_cards': '💳 Pagar con Tarjeta', 'pay_stars': 'Pagar con Stars',
+        'pay_crypto': 'Pagar con Crypto', 'pay_already': '✅ Ya Pagué', 'pay_link': '🔗 Pagar Aquí',
+    },
+    'pt': {
+        'welcome_message': 'Bem-vindo! Selecione um produto abaixo.',
+        'purchase_message': 'Obrigado!\n\nSeu acesso: {invite_link}\n\nBem-vindo!',
+        'subscription_message': 'Obrigado!\n\nPlano: {plan_name}\nExpira: {expires}\n\nSeu acesso: {invite_link}',
+        'permanent': 'Permanente (não expira)',
+        'select_plan': 'Escolha seu plano abaixo para começar:',
+        'full_access': 'Acesso completo',
+        'price_label': 'Preço:',
+        'duration_label': 'Duração:',
+        'forever': 'Para sempre',
+        'myaccess_title': '🎟 Suas Compras',
+        'myaccess_empty': 'Você ainda não tem compras.',
+        'myaccess_product': 'Produto:',
+        'myaccess_plan': 'Plano:',
+        'myaccess_expires': 'Expira:',
+        'myaccess_status': 'Status:',
+        'myaccess_link': 'Acesso:',
+        'myaccess_status_active': '✅ Ativo',
+        'myaccess_status_expired': '❌ Expirado',
+        'myaccess_status_permanent': '♾ Permanente',
+        'coupon_prompt': '🎟 Envie o código do cupom:\n\nEnvie /cancel para cancelar.',
+        'coupon_invalid': '❌ Código de cupom inválido.',
+        'coupon_expired': '❌ Este cupom expirou.',
+        'coupon_max_uses': '❌ Este cupom atingiu seu limite de uso.',
+        'coupon_activated': '✅ Cupom ativado! Desconto aplicará no pagamento com PayPal, Crypto ou Stars.',
+        'coupon_applied': 'Cupom aplicado:',
+        'original_price': 'Original:',
+        'final_price': 'Você paga:',
+        'balance_title': '💰 Seu Saldo',
+        'balance_current': 'Saldo atual:',
+        'balance_recharge_prompt': 'Envie o valor que deseja adicionar (em USD), ex: 10:\n\nEnvie /cancel para cancelar.',
+        'balance_invalid_amount': '❌ Valor inválido. Envie um número positivo.',
+        'balance_insufficient': '❌ Saldo insuficiente. Você tem $${current}, faltam $${needed}. Use /recharge para adicionar fundos.',
+        'balance_recharged': '✅ Saldo recarregado. Novo saldo: ${balance}',
+        'balance_paid': '✅ Pago com saldo. Novo saldo: ${balance}',
+        'balance_confirm': 'Confirmar compra com saldo',
+        'balance_after': 'Saldo depois:',
+        'confirm_yes': '✅ Confirmar',
+        'confirm_no': '❌ Cancelar',
+        'purchase_cancelled': 'Compra cancelada.', 'back': 'Voltar',
+        'refund_notification': 'Você recebeu reembolso de ${amount}. Novo saldo: ${balance}.',
+        'transfer_prompt_amount': 'Quanto deseja transferir? Envie o valor:',
+        'transfer_prompt_id': 'Envie o ID do Telegram do destinatário.\nDica: o destinatário pode ver seu ID enviando /myid para este bot.',
+        'transfer_invalid_id': 'ID inválido. Envie um número.',
+        'transfer_self': 'Você não pode transferir para si mesmo.',
+        'transfer_insufficient': 'Saldo insuficiente.',
+        'transfer_pending': 'Solicitação de transferência enviada. Aguardando aprovação do admin.\nValor: ${amount}\nPara: {to_id}',
+        'transfer_approved': 'Sua transferência de ${amount} foi aprovada. Novo saldo: ${balance}.',
+        'transfer_received': 'Você recebeu ${amount}. Seu saldo: ${balance}.',
+        'transfer_rejected': 'Sua transferência de ${amount} foi rejeitada.',
+        'your_id_is': 'Seu ID do Telegram é:',
+        'pay_with_balance_btn': 'Pagar com Saldo',
+        'recharge_balance_btn': '💰 Recarregar Saldo',
+        'hotmart_no_coupon': '⚠️ Cupons não aplicam para pagamentos com cartão.',
+        'no_products': 'Nenhum produto disponível.',
+        'already_purchased': 'Você já comprou este produto.',
+        'no_refunds': 'Este é um produto digital. Não há reembolsos disponíveis após a compra.',
+        'crypto_payment_title': '💎 **Pagamento Crypto**',
+        'crypto_product': 'Produto:', 'crypto_amount': 'Valor:',
+        'crypto_payment_info': 'Clique para pagar com USDT, BTC, ETH e mais.',
+        'crypto_after_payment': 'Após pagamento, acesso entregue automaticamente.',
+        'crypto_error': 'Erro ao criar fatura. Tente novamente.', 'crypto_minimum': 'Valor mínimo para crypto é $0.10 USD.', 'sub_expiring': '⏰ Sua assinatura de ${product} tem ${time} restante.', 'sub_expiring_soon': '⚠️ Sua assinatura de ${product} expira em ${time}!', 'sub_expired': '❌ Sua assinatura de ${product} expirou. Você pode comprar novamente quando quiser!', 'reportbug_ask': 'Descreva o bug ou problema (apenas texto):\n\nEnvie /cancel para cancelar.', 'reportbug_sent': '✅ Relatório de bug enviado. Obrigado!', 'reportbug_empty': 'Por favor descreva o bug.', 'cancelled': '❌ Cancelado.',
+        'crypto_not_configured': 'Preço crypto não configurado.',
+        'stars_not_configured': 'Preço Stars não configurado.',
+        'product_not_found': 'Produto não encontrado.', 'bot_not_found': 'Bot não encontrado.',
+        'support_message': 'Suporte:',
+        'important_exact': '⚠️ **Importante:** Envie exatamente **${price} {currency}**',
+        'after_payment_proof': 'Após pagar, clique para enviar comprovante:', 'paypal_note': 'Nota',
+        'send_email': '📧 Envie seu e-mail:',
+        'invalid_email': '❌ E-mail inválido.',
+        'send_transaction': '🔢 Envie seu ID de transação:',
+        'send_code': '🔑 Envie o código do cartão presente:',
+        'send_proof': '📎 Envie comprovante (captura ou documento):',
+        'invalid_proof': '❌ Envie imagem ou documento.',
+        'proof_submitted': '✅ Comprovante enviado! Pagamento em análise.',
+        'proof_error': '❌ Erro. Tente novamente.',
+        'invite_error': 'Pagamento recebido mas não foi possível gerar link. Contate suporte.',
+        'already_access': 'Você já tem acesso.',
+        'language_changed': '✅ Idioma alterado!',
+        'pay_cards': '💳 Pagar com Cartão', 'pay_stars': 'Pagar com Stars',
+        'pay_crypto': 'Pagar com Crypto', 'pay_already': '✅ Já Paguei', 'pay_link': '🔗 Pagar Aqui',
+    },
+    'fr': {
+        'welcome_message': 'Bienvenue ! Sélectionnez un produit.',
+        'purchase_message': 'Merci !\n\nVotre accès : {invite_link}\n\nBienvenue !',
+        'subscription_message': 'Merci !\n\nPlan : {plan_name}\nExpire : {expires}\n\nVotre accès : {invite_link}',
+        'permanent': 'Permanent (n\'expire jamais)',
+        'select_plan': 'Choisissez votre plan ci-dessous pour commencer :',
+        'full_access': 'Accès complet',
+        'price_label': 'Prix :',
+        'duration_label': 'Durée :',
+        'forever': 'Pour toujours',
+        'myaccess_title': '🎟 Vos Achats',
+        'myaccess_empty': 'Vous n\'avez pas encore d\'achats.',
+        'myaccess_product': 'Produit :',
+        'myaccess_plan': 'Plan :',
+        'myaccess_expires': 'Expire :',
+        'myaccess_status': 'Statut :',
+        'myaccess_link': 'Accès :',
+        'myaccess_status_active': '✅ Actif',
+        'myaccess_status_expired': '❌ Expiré',
+        'myaccess_status_permanent': '♾ Permanent',
+        'coupon_prompt': '🎟 Envoyez le code du coupon :',
+        'coupon_invalid': '❌ Code de coupon invalide.',
+        'coupon_expired': '❌ Ce coupon a expiré.',
+        'coupon_max_uses': '❌ Ce coupon a atteint sa limite d\'utilisation.',
+        'coupon_activated': '✅ Coupon activé ! La remise sera appliquée pour PayPal, Crypto et Stars.',
+        'coupon_applied': 'Coupon appliqué :',
+        'original_price': 'Original :',
+        'final_price': 'Vous payez :',
+        'balance_title': '💰 Votre Solde',
+        'balance_current': 'Solde actuel :',
+        'balance_recharge_prompt': 'Envoyez le montant à ajouter (en USD), ex : 10 :',
+        'balance_invalid_amount': '❌ Montant invalide. Envoyez un nombre positif.',
+        'balance_insufficient': '❌ Solde insuffisant. Vous avez $${current}, il manque $${needed}. Utilisez /recharge pour ajouter des fonds.',
+        'balance_recharged': '✅ Solde rechargé. Nouveau solde : ${balance}',
+        'balance_paid': '✅ Payé avec solde. Nouveau solde : ${balance}',
+        'balance_confirm': 'Confirmer achat avec solde',
+        'balance_after': 'Solde après :',
+        'confirm_yes': '✅ Confirmer',
+        'confirm_no': '❌ Annuler',
+        'purchase_cancelled': 'Achat annulé.', 'back': 'Retour',
+        'refund_notification': 'Vous avez été remboursé de ${amount}. Nouveau solde : ${balance}.',
+        'transfer_prompt_amount': 'Combien voulez-vous transférer ? Envoyez le montant :',
+        'transfer_prompt_id': 'Envoyez l\'ID Telegram du destinataire.\nAstuce : le destinataire peut voir son ID en envoyant /myid à ce bot.',
+        'transfer_invalid_id': 'ID invalide. Envoyez un nombre.',
+        'transfer_self': 'Vous ne pouvez pas transférer à vous-même.',
+        'transfer_insufficient': 'Solde insuffisant.',
+        'transfer_pending': 'Demande de transfert envoyée. En attente d\'approbation.\nMontant : ${amount}\nPour : {to_id}',
+        'transfer_approved': 'Votre transfert de ${amount} a été approuvé. Nouveau solde : ${balance}.',
+        'transfer_received': 'Vous avez reçu ${amount}. Votre solde : ${balance}.',
+        'transfer_rejected': 'Votre transfert de ${amount} a été rejeté.',
+        'your_id_is': 'Votre ID Telegram est :',
+        'pay_with_balance_btn': 'Payer avec Solde',
+        'recharge_balance_btn': '💰 Recharger Solde',
+        'hotmart_no_coupon': '⚠️ Les coupons ne s\'appliquent pas aux paiements par carte.',
+        'no_products': 'Aucun produit disponible.',
+        'already_purchased': 'Vous avez déjà acheté.',
+        'no_refunds': 'Ceci est un produit numérique. Aucun remboursement n\'est disponible après l\'achat.',
+        'crypto_payment_title': '💎 **Paiement Crypto**',
+        'crypto_product': 'Produit :', 'crypto_amount': 'Montant :',
+        'crypto_payment_info': 'Cliquez pour payer en USDT, BTC, ETH et plus.',
+        'crypto_after_payment': 'Après paiement, accès livré automatiquement.',
+        'crypto_error': 'Erreur. Réessayez.', 'crypto_minimum': 'Le montant minimum pour crypto est $0.10 USD.', 'sub_expiring': '⏰ Votre abonnement à ${product} a ${time} restant.', 'sub_expiring_soon': '⚠️ Votre abonnement à ${product} expire dans ${time}!', 'sub_expired': '❌ Votre abonnement à ${product} a expiré. Vous pouvez racheter quand vous voulez!', 'reportbug_ask': 'Décrivez le bug ou problème (texte uniquement):\n\nEnvoyez /cancel pour annuler.', 'reportbug_sent': '✅ Rapport de bug envoyé. Merci!', 'reportbug_empty': 'Veuillez décrire le bug.', 'cancelled': '❌ Annulé.',
+        'crypto_not_configured': 'Prix crypto non configuré.',
+        'stars_not_configured': 'Prix Stars non configuré.',
+        'product_not_found': 'Produit introuvable.', 'bot_not_found': 'Bot introuvable.',
+        'support_message': 'Support :',
+        'important_exact': '⚠️ **Important :** Envoyez exactement **${price} {currency}**',
+        'after_payment_proof': 'Après paiement, cliquez pour envoyer preuve :', 'paypal_note': 'Note',
+        'send_email': '📧 Envoyez votre e-mail :',
+        'invalid_email': '❌ E-mail invalide.',
+        'send_transaction': '🔢 Envoyez votre ID de transaction :',
+        'send_code': '🔑 Envoyez le code carte cadeau :',
+        'send_proof': '📎 Envoyez preuve de paiement :',
+        'invalid_proof': '❌ Envoyez image ou document.',
+        'proof_submitted': '✅ Preuve envoyée ! Paiement en vérification.',
+        'proof_error': '❌ Erreur. Réessayez.',
+        'invite_error': 'Paiement reçu mais impossible de générer le lien. Contactez support.',
+        'already_access': 'Vous avez déjà accès.',
+        'language_changed': '✅ Langue modifiée !',
+        'pay_cards': '💳 Payer par Carte', 'pay_stars': 'Payer avec Stars',
+        'pay_crypto': 'Payer avec Crypto', 'pay_already': '✅ Déjà payé', 'pay_link': '🔗 Payer Ici',
+    }
+}
+
+def is_user_banned(tid, bot_id):
+    """Check if a user is banned from a specific bot"""
+    try:
+        r = supabase.table('banned_users').select('id').eq('telegram_user_id', tid).eq('bot_id', bot_id).limit(1).execute()
+        return bool(r.data)
+    except:
+        return False
+
+def get_user_balance(tid, bot_id):
+    """Get user's balance for a bot"""
+    try:
+        r = supabase.table('user_balances').select('balance').eq('telegram_user_id', tid).eq('bot_id', bot_id).limit(1).execute()
+        if r.data: return float(r.data[0]['balance'])
+    except: pass
+    return 0.0
+
+def add_balance_transaction(tid, bot_id, amount, type_, reference=None, description="", admin_note=None):
+    """Add to user balance and log transaction"""
+    try:
+        current = get_user_balance(tid, bot_id)
+        new_balance = current + float(amount)
+        logger.info(f"Balance update: user {tid}, current={current}, amount={amount}, new={new_balance}, type={type_}")
+        supabase.table('user_balances').upsert({
+            'telegram_user_id': tid, 'bot_id': bot_id, 'balance': new_balance,
+            'currency': 'USD', 'updated_at': datetime.now().isoformat()
+        }, on_conflict='telegram_user_id,bot_id').execute()
+        supabase.table('balance_transactions').insert({
+            'telegram_user_id': tid, 'bot_id': bot_id, 'amount': float(amount),
+            'type': type_, 'reference': reference, 'description': description, 'admin_note': admin_note
+        }).execute()
+        return new_balance
+    except Exception as e:
+        logger.error(f"Error updating balance: {e}", exc_info=True)
+        return None
+
+def get_active_coupon(tid, bot_id):
+    """Get user's currently active coupon (entered via /coupon)"""
+    try:
+        r = supabase.table('user_active_coupons').select('coupon_id').eq('telegram_user_id', tid).eq('bot_id', bot_id).limit(1).execute()
+        if not r.data: return None
+        cid = r.data[0]['coupon_id']
+        cr = supabase.table('coupons').select('*').eq('id', cid).eq('is_active', True).limit(1).execute()
+        if not cr.data: return None
+        c = cr.data[0]
+        # Check expiration
+        if c.get('expires_at'):
+            try:
+                exp = datetime.fromisoformat(c['expires_at'].replace('Z', '+00:00')).replace(tzinfo=None)
+                if exp < datetime.now(): return None
+            except: pass
+        # Check max uses
+        if c.get('max_uses') and c.get('current_uses', 0) >= c['max_uses']:
+            return None
+        return c
+    except: pass
+    return None
+
+def apply_coupon_discount(price, coupon, method, product=None):
+    """Apply coupon to price for a specific payment method. Returns (final_price, applied)"""
+    if not coupon: return price, False
+    # Skip if product is excluded from coupons
+    if product and product.get('exclude_from_coupons'):
+        return price, False
+    method_field = f"applies_to_{method}"
+    if not coupon.get(method_field, True): return price, False
+    discount_type = coupon.get('discount_type', 'percent')
+    discount_value = float(coupon.get('discount_value', 0))
+    if discount_type == 'percent':
+        return max(0, price * (1 - discount_value / 100)), True
+    else:  # fixed
+        return max(0, price - discount_value), True
+
+def redeem_coupon(tid, bot_id, coupon_id, sale_reference=None):
+    """Mark coupon as redeemed and increment usage"""
+    try:
+        # Update activation row
+        supabase.table('coupon_activations').update({
+            'redeemed_at': datetime.now().isoformat()
+        }).eq('coupon_id', coupon_id).eq('telegram_user_id', tid).is_('redeemed_at', 'null').execute()
+        # Increment usage counter
+        cr = supabase.table('coupons').select('current_uses').eq('id', coupon_id).limit(1).execute()
+        if cr.data:
+            cu = (cr.data[0].get('current_uses', 0) or 0) + 1
+            supabase.table('coupons').update({'current_uses': cu}).eq('id', coupon_id).execute()
+        # Clear active coupon
+        supabase.table('user_active_coupons').delete().eq('telegram_user_id', tid).eq('bot_id', bot_id).execute()
+    except Exception as e:
+        logger.error(f"Error redeeming coupon: {e}")
+
+def get_user_language(tid, bot_id):
+    try:
+        r = supabase.table('user_language_preferences').select('language_code').eq('telegram_user_id', tid).eq('bot_id', bot_id).limit(1).execute()
+        if r.data: return r.data[0]['language_code']
+    except: pass
+    return 'en'
+
+def set_user_language(tid, bot_id, lc):
+    try: supabase.table('user_language_preferences').upsert({'telegram_user_id': tid, 'bot_id': bot_id, 'language_code': lc, 'updated_at': datetime.now().isoformat()}, on_conflict='telegram_user_id,bot_id').execute()
+    except: pass
+
+def get_bot_languages(bot_id):
+    global cached_bot_languages, cached_bot_languages_time
+    now = datetime.now()
+    if bot_id in cached_bot_languages and bot_id in cached_bot_languages_time and (now - cached_bot_languages_time[bot_id]).total_seconds() < 300:
+        return cached_bot_languages[bot_id]
+    
+    LANG_ORDER = ['en', 'es', 'pt', 'fr']
+    try:
+        r = supabase.table('bot_languages').select('language_code').eq('bot_id', bot_id).eq('is_enabled', True).execute()
+        if r.data:
+            enabled = set(x['language_code'] for x in r.data)
+            # Sort by preferred order
+            ordered = [lc for lc in LANG_ORDER if lc in enabled]
+            cached_bot_languages[bot_id] = ordered
+            cached_bot_languages_time[bot_id] = now
+            return ordered
+    except: pass
+    # Default to all 4 languages in preferred order
+    return LANG_ORDER
+
+def t(key, lang, **kw):
+    tr = DEFAULT_TRANSLATIONS.get(lang, DEFAULT_TRANSLATIONS['en'])
+    txt = tr.get(key, DEFAULT_TRANSLATIONS['en'].get(key, key))
+    if kw:
+        try: txt = txt.format(**kw)
+        except: pass
+    return txt
+
+def get_global_payment_order():
+    global cached_payment_order, cached_payment_order_time
+    default = ["hotmart", "manual", "stars", "crypto"]
+    now = datetime.now()
+    if cached_payment_order and cached_payment_order_time and (now - cached_payment_order_time).total_seconds() < 60:
+        return cached_payment_order
+    try:
+        r = supabase.table('app_settings').select('payment_methods_order').limit(1).execute()
+        if r.data:
+            v = r.data[0].get('payment_methods_order')
+            cached_payment_order = json.loads(v) if isinstance(v, str) else (v if isinstance(v, list) else default)
+        else: cached_payment_order = default
+    except: cached_payment_order = default
+    cached_payment_order_time = now
+    return cached_payment_order
+
+def get_all_manual_methods():
+    global cached_manual_methods, cached_manual_methods_time
+    now = datetime.now()
+    if cached_manual_methods is not None and cached_manual_methods_time and (now - cached_manual_methods_time).total_seconds() < 60:
+        return cached_manual_methods
+    try:
+        r = supabase.table('manual_payment_methods').select('*').eq('is_enabled', True).order('display_order').execute()
+        cached_manual_methods = r.data or []
+    except: cached_manual_methods = []
+    cached_manual_methods_time = now
+    return cached_manual_methods
+
+def get_all_assignments():
+    global cached_assignments, cached_assignments_time
+    now = datetime.now()
+    if cached_assignments is not None and cached_assignments_time and (now - cached_assignments_time).total_seconds() < 60:
+        return cached_assignments
+    try:
+        r = supabase.table('payment_method_assignments').select('*').execute()
+        cached_assignments = r.data or []
+    except: cached_assignments = []
+    cached_assignments_time = now
+    return cached_assignments
+
+def get_methods_for_product(product_id, bot_id):
+    methods = get_all_manual_methods()
+    assignments = get_all_assignments()
+    if not methods: return []
+    ok_product = set(a.get('method_id') for a in assignments if a.get('product_id') == product_id)
+    ok_bot = set(a.get('method_id') for a in assignments if a.get('bot_id') == bot_id and not a.get('product_id'))
+    ok_global = set(a.get('method_id') for a in assignments if not a.get('product_id') and not a.get('bot_id'))
+    result = []
+    for m in methods:
+        mid = m['id']
+        if mid in ok_product or mid in ok_bot or mid in ok_global:
+            result.append(m)
+    return result
+
+def find_method_by_short(sid):
+    for m in get_all_manual_methods():
+        if m['id'].startswith(sid): return m
+    return None
+
+def get_subscription_plans(product_id):
+    """Get active subscription plans for a product, ordered by display_order"""
+    try:
+        r = supabase.table('subscription_plans').select('*').eq('product_id', product_id).eq('is_enabled', True).order('display_order').execute()
+        return r.data or []
+    except Exception as e:
+        logger.error(f"Error loading subscription plans: {e}")
+        return []
+
+def find_plan_by_short(short_id, product_id=None):
+    try:
+        q = supabase.table('subscription_plans').select('*').eq('is_enabled', True)
+        if product_id: q = q.eq('product_id', product_id)
+        r = q.execute()
+        logger.info(f"find_plan_by_short: looking for '{short_id}', found {len(r.data or [])} enabled plans")
+        for p in (r.data or []):
+            if p['id'].startswith(short_id): return p
+        # Try without is_enabled filter
+        q2 = supabase.table('subscription_plans').select('*')
+        if product_id: q2 = q2.eq('product_id', product_id)
+        r2 = q2.execute()
+        logger.info(f"find_plan_by_short: total plans (incl disabled): {len(r2.data or [])}")
+    except Exception as e:
+        logger.error(f"find_plan_by_short error: {e}")
+    return None
+
+def get_notification_settings():
+    global cached_notif_settings, cached_notif_settings_time
+    now = datetime.now()
+    if cached_notif_settings is not None and cached_notif_settings_time and (now - cached_notif_settings_time).total_seconds() < 60:
+        return cached_notif_settings
+    try:
+        r = supabase.table('notification_settings').select('*').limit(1).execute()
+        cached_notif_settings = r.data[0] if r.data else {'notify_1day_before': True, 'notify_1hour_before': True, 'notify_15min_before': True}
+    except:
+        cached_notif_settings = {'notify_1day_before': True, 'notify_1hour_before': True, 'notify_15min_before': True}
+    cached_notif_settings_time = now
+    return cached_notif_settings
+
+PAYPAL_SAFE_NOTES = [
+    "Books", "Music", "Photos", "Movies", "Games", "Art", "Cards", "Map",
+    "Notebook", "Sketch", "Print", "Poster", "Sticker", "Magnet", "Stamp",
+    "Letter", "Frame", "Painting", "Guitar", "Piano", "Drums", "Puzzle",
+    "Lego", "Toys", "Gift", "Camera", "Watch", "Lamp", "Hat", "Shirt",
+    "Backpack", "Bag", "Cup", "Box", "Pencil", "Pen", "Card", "Tea",
+    "Coffee", "Cake", "Cookies", "Juice", "Bread", "Salad", "Fruit",
+    "Plants", "Pets", "Bird", "Sports", "Travel", "Food", "Tools",
+]
+
+ADMIN_GROUP_ID = -1003842247146  # Telegram group for admin notifications
+BUG_REPORT_GROUP_ID = -1003904465776  # Telegram group for bug reports
+
+async def send_telegram_notification(text):
+    """Send notification to admin Telegram group"""
+    if not ADMIN_GROUP_ID:
+        logger.warning("ADMIN_GROUP_ID not set, skipping telegram notification")
+        return
+    try:
+        for bun, app in active_bots.items():
+            try:
+                await app.bot.send_message(chat_id=ADMIN_GROUP_ID, text=text)
+                logger.info(f"Admin notification sent via {bun}")
+                return
+            except Exception as e:
+                logger.error(f"Failed to send admin notification via {bun}: {e}")
+                continue
+        logger.error("No active bot could send admin notification")
+    except Exception as e:
+        logger.error(f"Telegram admin notification error: {e}")
+
+async def send_admin_notification(text):
+    """Send admin notification via Telegram group only"""
+    await send_telegram_notification(text)
+
+async def send_sale_notification(pname, amount, cur, method, uid, uname, plan=None, stars_amount=None):
+    ut = f"@{uname}" if uname and uname != "Unknown" else "No username"
+    msg = f"New Sale\n\nProduct: {pname}\nAmount: ${amount} {cur}\nMethod: {method}\nUser ID: {uid}\nUsername: {ut}"
+    if stars_amount: msg += f"\nStars: {stars_amount} ⭐"
+    if plan: msg += f"\nPlan: {plan}"
+    await send_admin_notification(msg)
+
+async def create_oxapay_invoice(amt, pid, tid, pname, plan_id=None):
+    try:
+        plan_part = f"_{plan_id[:8]}" if plan_id else ""
+        oid = f"cx_{pid[:8]}{plan_part}_{tid}_{int(datetime.now().timestamp())}"
+        payload = {'amount': round(float(amt), 2), 'currency': 'USD', 'life_time': 30, 'fee_paid_by_payer': 1, 'under_paid_coverage': 10, 'callback_url': 'https://he.nothumxn.com/webhook/oxapay', 'return_url': 'https://t.me/', 'description': str(pname)[:64], 'order_id': str(oid)[:50], 'email': 'noreply@bot.com'}
+        logger.info(f"OxaPay request: {payload}")
+        async with aiohttp.ClientSession() as s:
+            async with s.post(OXAPAY_API_URL, json=payload, headers={'merchant_api_key': OXAPAY_MERCHANT_KEY, 'Content-Type': 'application/json'}) as r:
+                data = await r.json()
+                logger.info(f"OxaPay response: {data}")
+                if data.get('result') == 100 or data.get('status') == 200:
+                    return data.get('payLink') or data.get('data', {}).get('payment_url', '')
+                logger.error(f"OxaPay returned non-success: {data}")
+    except Exception as e:
+        logger.error(f"OxaPay exception: {e}", exc_info=True)
+    return None
+
+async def get_or_create_link_gen_bot(bot_config, product=None):
+    """Get the link generator bot. Product-level token overrides bot-level."""
+    token = None
+    if product:
+        token = product.get('link_generator_bot_token')
+    if not token:
+        token = bot_config.get('link_generator_bot_token')
+    if not token: return None
+    # Use token as cache key
+    if token in link_gen_bots:
+        return link_gen_bots[token]
+    try:
+        b = Bot(token=token)
+        await b.initialize()
+        link_gen_bots[token] = b
+        logger.info(f"Link gen bot created for {bot_config.get('bot_username')} (product override: {bool(product and product.get('link_generator_bot_token'))})")
+        return b
+    except Exception as e:
+        logger.error(f"Error creating link gen bot: {e}")
+        return None
+
+async def generate_invite_link(bot_config, product, tid, uname):
+    """Generate an invite link for the subscription. Uses link_generator_bot if configured."""
+    channel_id = product.get('channel_chat_id')
+    if not channel_id:
+        return None
+    
+    # Try link generator bot first
+    link_bot = await get_or_create_link_gen_bot(bot_config, product)
+    
+    # Fall back to main bot
+    if not link_bot:
+        bot_username = bot_config['bot_username']
+        if bot_username in active_bots:
+            link_bot = active_bots[bot_username].bot
+    
+    if not link_bot:
+        return None
+    
+    try:
+        name = f"{uname or 'user'}_{tid}"[:32]
+        result = await link_bot.create_chat_invite_link(
+            chat_id=channel_id,
+            name=name,
+            member_limit=2,
+            creates_join_request=False
+        )
+        return result.invite_link
+    except Exception as e:
+        logger.error(f"Error creating invite link: {e}")
+        return None
+
+def build_payment_buttons_for_plan(product, plan, sck, lang, bot_id, uid=None):
+    """Build payment buttons using plan price instead of product price"""
+    order = get_global_payment_order()
+    kb = []
+    price = float(plan['price']) if plan else float(product['price'])
+    plan_short = plan['id'][:8] if plan else ''
+    logger.info(f"Payment order: {order}")
+    
+    for method in order:
+        if method == "hotmart" and product.get('enable_hotmart'):
+            url = (plan.get('hotmart_checkout_url') if plan else None) or product.get('hotmart_payment_url', '')
+            if url:
+                purl = f"{url}&sck={sck}" if '?' in url else f"{url}?sck={sck}"
+                kb.append([InlineKeyboardButton(t('pay_cards', lang), url=purl)])
+        elif method == "manual":
+            methods = get_methods_for_product(product['id'], bot_id)
+            for mm in methods:
+                btn = mm['method_name']
+                cb = f"mm_{product['id']}_{mm['id'][:8]}"
+                if plan_short: cb += f"_{plan_short}"
+                kb.append([InlineKeyboardButton(btn, callback_data=cb[:64])])
+        elif method == "stars" and product.get('enable_telegram_stars'):
+            sp = (plan.get('telegram_stars_price') if plan else product.get('telegram_stars_price')) or product.get('telegram_stars_price')
+            if sp:
+                cb = f"stars_{product['id']}"
+                if plan_short: cb += f"_{plan_short}"
+                kb.append([InlineKeyboardButton(t('pay_stars', lang), callback_data=cb[:64])])
+        elif method == "crypto" and product.get('enable_crypto'):
+            cp = price
+            if cp:
+                cb = f"crypto_{product['id']}"
+                if plan_short: cb += f"_{plan_short}"
+                kb.append([InlineKeyboardButton(t('pay_crypto', lang), callback_data=cb[:64])])
+        elif method == "balance" and uid:
+            cb = f"paybal_{product['id']}"
+            if plan_short: cb += f"_{plan_short}"
+            kb.append([InlineKeyboardButton(t('pay_with_balance_btn', lang), callback_data=cb[:64])])
+    
+    # Fallback: if "balance" not in order, still show it at the end
+    if uid and "balance" not in order:
+        cb = f"paybal_{product['id']}"
+        if plan_short: cb += f"_{plan_short}"
+        kb.append([InlineKeyboardButton(t('pay_with_balance_btn', lang), callback_data=cb[:64])])
+    
+    return kb
+
+def build_payment_buttons(product, sck, lang='en', bot_id=None, uid=None):
+    return build_payment_buttons_for_plan(product, None, sck, lang, bot_id or product.get('bot_id', ''), uid)
+
+def show_lang_kb(bot_id):
+    kb = [[InlineKeyboardButton(LANGUAGE_FLAGS[lc], callback_data=f"lang_{bot_id}_{lc}")] for lc in get_bot_languages(bot_id) if lc in LANGUAGE_FLAGS]
+    return InlineKeyboardMarkup(kb or [[InlineKeyboardButton(LANGUAGE_FLAGS['en'], callback_data=f"lang_{bot_id}_en")]])
+
+def format_duration(minutes):
+    if not minutes or minutes == 0: return None
+    if minutes < 60: return f"{minutes}m"
+    if minutes < 1440: return f"{minutes // 60}h"
+    return f"{minutes // 1440}d"
+
+def next_step(ctx, lang):
+    step = ctx.user_data.get('mp_step', 'start')
+    if step == 'start' and ctx.user_data.get('mp_req_email'):
+        ctx.user_data['mp_step'] = 'email'
+        return WAITING_EMAIL, t('send_email', lang)
+    if step in ('start', 'email') and ctx.user_data.get('mp_req_trans'):
+        ctx.user_data['mp_step'] = 'transaction'
+        return WAITING_TRANSACTION, t('send_transaction', lang)
+    if step in ('start', 'email', 'transaction') and ctx.user_data.get('mp_req_code'):
+        ctx.user_data['mp_step'] = 'code'
+        return WAITING_CODE, t('send_code', lang)
+    ctx.user_data['mp_step'] = 'proof'
+    return WAITING_PROOF, t('send_proof', lang)
+
+
+class BotManager:
+    @staticmethod
+    async def load_products(bot_id):
+        try:
+            r = supabase.table('products').select('*').eq('bot_id', bot_id).eq('is_active', True).order('display_order').execute()
+            return r.data or []
+        except: return []
+
+    @staticmethod
+    async def load_categories(bot_id):
+        try:
+            r = supabase.table('categories').select('*').eq('bot_id', bot_id).eq('is_active', True).order('display_order').execute()
+            logger.info(f"load_categories: bot={bot_id}, found={len(r.data or [])}")
+            return r.data or []
+        except Exception as e:
+            logger.error(f"load_categories error: {e}")
+            return []
+
+    @staticmethod
+    async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        uid = update.effective_user.id
+        # Clear any waiting states
+        for k in ['waiting_coupon', 'waiting_recharge', 'waiting_transfer_amount', 'waiting_transfer_id', 'waiting_bug']:
+            context.user_data.pop(k, None)
+        r = supabase.table('bots').select('*').eq('bot_username', context.bot.username).eq('is_active', True).execute()
+        if not r.data:
+            await update.message.reply_text("Bot not found.")
+            return
+        bc = r.data[0]
+        # Check if user is banned
+        if is_user_banned(uid, bc['id']):
+            logger.info(f"Banned user {uid} tried to use bot @{context.bot.username}")
+            return  # Silent block
+        pr = supabase.table('user_language_preferences').select('language_code').eq('telegram_user_id', uid).eq('bot_id', bc['id']).limit(1).execute()
+        if pr.data:
+            lang = pr.data[0]['language_code']
+            # Check if user has balance and notify
+            bal = get_user_balance(uid, bc['id'])
+            if bal > 0:
+                await update.message.reply_text(f"*{t('balance_title', lang)}*\n{t('balance_current', lang)} ${bal:.2f} USD", parse_mode='Markdown')
+            await BotManager.show_products(update, context, bc, lang)
+            return
+        await update.message.reply_text("🌐 Select your language:", reply_markup=show_lang_kb(bc['id']))
+
+    @staticmethod
+    async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        for k in ['waiting_coupon', 'waiting_recharge', 'waiting_transfer_amount', 'waiting_transfer_id', 'waiting_bug']:
+            context.user_data.pop(k, None)
+        r = supabase.table('bots').select('*').eq('bot_username', context.bot.username).eq('is_active', True).execute()
+        if r.data:
+            await update.message.reply_text("🌐 Select your language:", reply_markup=show_lang_kb(r.data[0]['id']))
+
+    @staticmethod
+    async def language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        await q.answer()
+        parts = q.data.replace('lang_', '').rsplit('_', 1)
+        bot_id, lc = parts[0], parts[1]
+        set_user_language(update.effective_user.id, bot_id, lc)
+        bcr = supabase.table('bots').select('*').eq('id', bot_id).eq('is_active', True).execute()
+        if not bcr.data: return
+        await q.message.reply_text(t('language_changed', lc))
+        # Check if user has balance and notify
+        bal = get_user_balance(update.effective_user.id, bot_id)
+        if bal > 0:
+            await q.message.reply_text(f"*{t('balance_title', lc)}*\n{t('balance_current', lc)} ${bal:.2f} USD", parse_mode='Markdown')
+        await BotManager.show_products_q(q, context, bcr.data[0], lc)
+
+    @staticmethod
+    async def show_products(update, context, bc, lang):
+        prods = await BotManager.load_products(bc['id'])
+        cats = await BotManager.load_categories(bc['id'])
+        logger.info(f"show_products: {len(prods)} products, {len(cats)} categories for bot {bc['bot_username']}")
+        if not prods and not cats:
+            await update.message.reply_text(t('no_products', lang))
+            return
+        items = []
+        for c in cats:
+            items.append(('cat', c, c.get('display_order', 0)))
+        standalone = [p for p in prods if not p.get('category_id')]
+        logger.info(f"show_products: {len(standalone)} standalone, {len(prods) - len(standalone)} in categories")
+        for p in standalone:
+            items.append(('prod', p, p.get('display_order', 0)))
+        items.sort(key=lambda x: x[2])
+        kb = []
+        for typ, item, _ in items:
+            if typ == 'cat':
+                kb.append([InlineKeyboardButton(f"{item['name']}", callback_data=f"cat_{item['id'][:30]}")])
+            else:
+                kb.append([InlineKeyboardButton(f"{item['product_name']} - ${item['price']} {item['currency']}", callback_data=f"product_{item['id']}")])
+        logger.info(f"show_products: showing {len(kb)} buttons")
+        await update.message.reply_text(t('welcome_message', lang), reply_markup=InlineKeyboardMarkup(kb))
+
+    @staticmethod
+    async def show_products_q(q, context, bc, lang):
+        prods = await BotManager.load_products(bc['id'])
+        cats = await BotManager.load_categories(bc['id'])
+        if not prods and not cats:
+            await q.message.reply_text(t('no_products', lang))
+            return
+        items = []
+        for c in cats:
+            items.append(('cat', c, c.get('display_order', 0)))
+        for p in prods:
+            if not p.get('category_id'):
+                items.append(('prod', p, p.get('display_order', 0)))
+        items.sort(key=lambda x: x[2])
+        kb = []
+        for typ, item, _ in items:
+            if typ == 'cat':
+                kb.append([InlineKeyboardButton(f"{item['name']}", callback_data=f"cat_{item['id'][:30]}")])
+            else:
+                kb.append([InlineKeyboardButton(f"{item['product_name']} - ${item['price']} {item['currency']}", callback_data=f"product_{item['id']}")])
+        await q.message.reply_text(t('welcome_message', lang), reply_markup=InlineKeyboardMarkup(kb))
+
+    @staticmethod
+    async def category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show products inside a category (without price)"""
+        q = update.callback_query
+        await q.answer()
+        for k in ['waiting_coupon', 'waiting_recharge', 'waiting_transfer_amount', 'waiting_transfer_id', 'waiting_bug']:
+            context.user_data.pop(k, None)
+        cat_short = q.data.replace('cat_', '')
+        uid = update.effective_user.id
+        r = supabase.table('bots').select('*').eq('bot_username', context.bot.username).eq('is_active', True).execute()
+        if not r.data: return
+        bc = r.data[0]
+        lang = get_user_language(uid, bc['id'])
+        cats = await BotManager.load_categories(bc['id'])
+        cat = None
+        for c in cats:
+            if c['id'].startswith(cat_short):
+                cat = c
+                break
+        if not cat:
+            await q.message.reply_text("Category not found.")
+            return
+        prods = await BotManager.load_products(bc['id'])
+        cat_prods = sorted([p for p in prods if p.get('category_id') == cat['id']], key=lambda p: p['product_name'].lower())
+        if not cat_prods:
+            await q.message.reply_text(t('no_products', lang))
+            return
+        kb = [[InlineKeyboardButton(p['product_name'], callback_data=f"product_{p['id']}")] for p in cat_prods]
+        kb.append([InlineKeyboardButton(f"⬅️ {t('back', lang)}", callback_data='back_to_products')])
+        await q.message.reply_text(f"{cat['name']}", reply_markup=InlineKeyboardMarkup(kb))
+
+    @staticmethod
+    async def cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Cancel conversation, clear state, and re-run the command"""
+        context.user_data.clear()
+        # Dismiss ForceReply
+        lang = 'en'
+        try:
+            r = supabase.table('bots').select('id').eq('bot_username', context.bot.username).eq('is_active', True).execute()
+            if r.data:
+                lang = get_user_language(update.effective_user.id, r.data[0]['id'])
+        except: pass
+        await update.message.reply_text(t('purchase_cancelled', lang), reply_markup=ReplyKeyboardRemove())
+        # Re-run the command the user typed
+        cmd = update.message.text.strip().split()[0].replace('/', '') if update.message and update.message.text else ''
+        cmd_map = {
+            'start': BotManager.start_command,
+            'language': BotManager.language_command,
+            'help': BotManager.help_command,
+            'myaccess': BotManager.myaccess_command,
+            'coupon': BotManager.coupon_command,
+            'recharge': BotManager.recharge_command,
+            'transfer': BotManager.transfer_command,
+            'myid': BotManager.myid_command,
+            'reportbug': BotManager.reportbug_command,
+        }
+        handler = cmd_map.get(cmd)
+        if handler:
+            try:
+                await handler(update, context)
+            except: pass
+        return ConversationHandler.END
+
+    @staticmethod
+    async def back_to_products_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        await q.answer()
+        r = supabase.table('bots').select('*').eq('bot_username', context.bot.username).eq('is_active', True).execute()
+        if not r.data: return
+        bc = r.data[0]
+        lang = get_user_language(update.effective_user.id, bc['id'])
+        await BotManager.show_products_q(q, context, bc, lang)
+
+    @staticmethod
+    async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        for k in ['waiting_coupon', 'waiting_recharge', 'waiting_transfer_amount', 'waiting_transfer_id', 'waiting_bug']:
+            context.user_data.pop(k, None)
+        r = supabase.table('bots').select('*').eq('bot_username', context.bot.username).eq('is_active', True).execute()
+        if r.data:
+            bc = r.data[0]
+            lang = get_user_language(update.effective_user.id, bc['id'])
+            await update.message.reply_text(f"{t('support_message', lang)} {bc.get('support_username', '@username')}")
+
+    @staticmethod
+    async def myaccess_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show user's purchases and access links"""
+        for k in ['waiting_coupon', 'waiting_recharge', 'waiting_transfer_amount', 'waiting_transfer_id', 'waiting_bug']:
+            context.user_data.pop(k, None)
+        uid = update.effective_user.id
+        r = supabase.table('bots').select('*').eq('bot_username', context.bot.username).eq('is_active', True).execute()
+        if not r.data: return
+        bc = r.data[0]
+        bot_id = bc['id']
+        lang = get_user_language(uid, bot_id)
+        
+        def esc(s):
+            """Escape markdown special chars"""
+            if not s: return ""
+            return str(s).replace('\\', '\\\\').replace('_', '\\_').replace('*', '\\*').replace('[', '\\[').replace('`', '\\`')
+        
+        messages = []
+        
+        # Get active subscriptions
+        try:
+            subs = supabase.table('user_subscriptions').select('*').eq('telegram_user_id', uid).eq('bot_id', bot_id).in_('status', ['active']).execute()
+            for sub in (subs.data or []):
+                try:
+                    product_name = "Unknown"
+                    product_access_link = None
+                    plan_name = ""
+                    if sub.get('product_id'):
+                        p = supabase.table('products').select('product_name, access_link, channel_chat_id').eq('id', sub['product_id']).limit(1).execute()
+                        if p.data:
+                            product_name = p.data[0]['product_name']
+                            # Only use access_link for channel/group products
+                            if p.data[0].get('channel_chat_id'):
+                                product_access_link = p.data[0].get('access_link')
+                    if sub.get('plan_id'):
+                        pl = supabase.table('subscription_plans').select('plan_name').eq('id', sub['plan_id']).limit(1).execute()
+                        if pl.data: plan_name = pl.data[0]['plan_name']
+                    
+                    if sub.get('expires_at'):
+                        try:
+                            expires_at = datetime.fromisoformat(sub['expires_at'].replace('Z', '+00:00')).replace(tzinfo=None)
+                            if expires_at > datetime.now():
+                                status = t('myaccess_status_active', lang)
+                                expires_text = expires_at.strftime('%Y-%m-%d %H:%M UTC')
+                            else:
+                                continue
+                        except:
+                            status = t('myaccess_status_active', lang)
+                            expires_text = "—"
+                    else:
+                        status = t('myaccess_status_permanent', lang)
+                        expires_text = t('forever', lang)
+                    
+                    block = f"━━━━━━━━━━━━━━\n"
+                    block += f"*{t('myaccess_product', lang)}* {esc(product_name)}\n"
+                    if plan_name:
+                        block += f"*{t('myaccess_plan', lang)}* {esc(plan_name)}\n"
+                    block += f"*{t('myaccess_status', lang)}* {status}\n"
+                    block += f"*{t('myaccess_expires', lang)}* {esc(expires_text)}\n"
+                    final_link = sub.get('invite_link') or product_access_link
+                    if final_link:
+                        block += f"*{t('myaccess_link', lang)}* {esc(final_link)}\n"
+                    messages.append(block)
+                except Exception as e:
+                    logger.error(f"Error processing sub {sub.get('id')}: {e}")
+                    continue
+        except Exception as e:
+            logger.error(f"Error loading subscriptions for /myaccess: {e}")
+        
+        # Get completed one-time purchases (non-subscription)
+        try:
+            sales = supabase.table('sales').select('*').eq('telegram_user_id', uid).eq('bot_id', bot_id).eq('status', 'completed').execute()
+            for sale in (sales.data or []):
+                try:
+                    if not sale.get('product_id'): continue
+                    # Skip if it's a subscription (already shown above)
+                    sub_check = supabase.table('user_subscriptions').select('id').eq('telegram_user_id', uid).eq('product_id', sale['product_id']).execute()
+                    if sub_check.data: continue
+                    
+                    product_name = "Unknown"
+                    product_link = None
+                    has_channel = False
+                    p = supabase.table('products').select('product_name, access_link, invite_link, channel_chat_id').eq('id', sale['product_id']).limit(1).execute()
+                    if p.data:
+                        product_name = p.data[0]['product_name']
+                        has_channel = bool(p.data[0].get('channel_chat_id'))
+                    
+                    # Check for saved invite link in user_subscriptions
+                    saved_link = None
+                    try:
+                        sl = supabase.table('user_subscriptions').select('invite_link').eq('telegram_user_id', uid).eq('product_id', sale['product_id']).limit(1).execute()
+                        if sl.data and sl.data[0].get('invite_link'):
+                            saved_link = sl.data[0]['invite_link']
+                    except: pass
+                    
+                    used_link = None
+                    try:
+                        ic = supabase.table('invite_codes').select('code').eq('used_by_telegram_user_id', uid).eq('product_id', sale['product_id']).limit(1).execute()
+                        if ic.data: used_link = ic.data[0]['code']
+                    except: pass
+                    
+                    block = f"━━━━━━━━━━━━━━\n"
+                    block += f"*{t('myaccess_product', lang)}* {esc(product_name)}\n"
+                    block += f"*{t('myaccess_status', lang)}* {t('myaccess_status_permanent', lang)}\n"
+                    final_link = saved_link or used_link
+                    if final_link:
+                        block += f"*{t('myaccess_link', lang)}* {esc(final_link)}\n"
+                    messages.append(block)
+                except Exception as e:
+                    logger.error(f"Error processing sale {sale.get('id')}: {e}")
+                    continue
+        except Exception as e:
+            logger.error(f"Error loading sales for /myaccess: {e}")
+        
+        if not messages:
+            await update.message.reply_text(t('myaccess_empty', lang))
+            return
+        
+        full_msg = f"*{t('myaccess_title', lang)}*\n\n" + "\n".join(messages)
+        try:
+            if len(full_msg) > 4000:
+                await update.message.reply_text(f"*{t('myaccess_title', lang)}*", parse_mode='Markdown')
+                for m in messages:
+                    try:
+                        await update.message.reply_text(m, parse_mode='Markdown', disable_web_page_preview=True)
+                    except Exception as e:
+                        logger.error(f"Markdown failed, sending plain: {e}")
+                        await update.message.reply_text(m.replace('*', '').replace('\\', ''), disable_web_page_preview=True)
+            else:
+                await update.message.reply_text(full_msg, parse_mode='Markdown', disable_web_page_preview=True)
+        except Exception as e:
+            logger.error(f"Error sending myaccess (falling back to plain): {e}")
+            # Fallback: plain text
+            try:
+                plain = full_msg.replace('*', '').replace('\\', '')
+                await update.message.reply_text(plain, disable_web_page_preview=True)
+            except Exception as e2:
+                logger.error(f"Even plain text failed: {e2}")
+                await update.message.reply_text("Error showing your purchases. Please contact support.")
+
+    @staticmethod
+    async def coupon_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Start the coupon code entry flow"""
+        uid = update.effective_user.id
+        r = supabase.table('bots').select('*').eq('bot_username', context.bot.username).eq('is_active', True).execute()
+        if not r.data: return
+        bc = r.data[0]
+        if is_user_banned(uid, bc['id']): return
+        lang = get_user_language(uid, bc['id'])
+        # Clear any other waiting state
+        context.user_data.pop('waiting_recharge', None)
+        context.user_data.pop('waiting_transfer_amount', None)
+        context.user_data.pop('waiting_transfer_id', None)
+        context.user_data.pop('waiting_bug', None)
+        context.user_data['waiting_coupon'] = bc['id']
+        await update.message.reply_text(t('coupon_prompt', lang), reply_markup=ForceReply(selective=True))
+
+    @staticmethod
+    async def recharge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show user balance and recharge options"""
+        uid = update.effective_user.id
+        r = supabase.table('bots').select('*').eq('bot_username', context.bot.username).eq('is_active', True).execute()
+        if not r.data: return
+        bc = r.data[0]
+        if is_user_banned(uid, bc['id']): return
+        lang = get_user_language(uid, bc['id'])
+        bal = get_user_balance(uid, bc['id'])
+        msg = f"*{t('balance_title', lang)}*\n\n*{t('balance_current', lang)}* ${bal:.2f} USD\n\n{t('balance_recharge_prompt', lang)}"
+        # Clear any other waiting state
+        context.user_data.pop('waiting_coupon', None)
+        context.user_data.pop('waiting_transfer_amount', None)
+        context.user_data.pop('waiting_transfer_id', None)
+        context.user_data.pop('waiting_bug', None)
+        context.user_data['waiting_recharge'] = bc['id']
+        await update.message.reply_text(msg, reply_markup=ForceReply(selective=True), parse_mode='Markdown')
+
+    @staticmethod
+    async def transfer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Start the balance transfer flow"""
+        uid = update.effective_user.id
+        r = supabase.table('bots').select('*').eq('bot_username', context.bot.username).eq('is_active', True).execute()
+        if not r.data: return
+        bc = r.data[0]
+        if is_user_banned(uid, bc['id']): return
+        lang = get_user_language(uid, bc['id'])
+        bal = get_user_balance(uid, bc['id'])
+        if bal <= 0:
+            await update.message.reply_text(t('transfer_insufficient', lang))
+            return
+        # Clear other waiting states
+        context.user_data.pop('waiting_coupon', None)
+        context.user_data.pop('waiting_recharge', None)
+        context.user_data.pop('waiting_transfer_id', None)
+        context.user_data.pop('waiting_bug', None)
+        context.user_data['waiting_transfer_amount'] = bc['id']
+        msg = f"*{t('balance_title', lang)}*\n*{t('balance_current', lang)}* ${bal:.2f} USD\n\n{t('transfer_prompt_amount', lang)}"
+        await update.message.reply_text(msg, reply_markup=ForceReply(selective=True), parse_mode='Markdown')
+
+    @staticmethod
+    async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Cancel any active flow"""
+        uid = update.effective_user.id
+        # Clear all waiting states and conversation data
+        context.user_data.clear()
+        r = supabase.table('bots').select('id').eq('bot_username', context.bot.username).eq('is_active', True).execute()
+        lang = 'en'
+        if r.data:
+            lang = get_user_language(uid, r.data[0]['id'])
+        await update.message.reply_text(t('cancelled', lang), reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+
+    @staticmethod
+    async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show user their Telegram ID"""
+        for k in ['waiting_coupon', 'waiting_recharge', 'waiting_transfer_amount', 'waiting_transfer_id', 'waiting_bug']:
+            context.user_data.pop(k, None)
+        uid = update.effective_user.id
+        r = supabase.table('bots').select('*').eq('bot_username', context.bot.username).eq('is_active', True).execute()
+        bc = r.data[0] if r.data else None
+        lang = get_user_language(uid, bc['id']) if bc else 'en'
+        await update.message.reply_text(f"{t('your_id_is', lang)} `{uid}`", parse_mode='Markdown')
+
+    @staticmethod
+    async def reportbug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Report a bug"""
+        uid = update.effective_user.id
+        context.user_data.pop('waiting_coupon', None)
+        context.user_data.pop('waiting_recharge', None)
+        context.user_data.pop('waiting_transfer_amount', None)
+        context.user_data.pop('waiting_transfer_id', None)
+        r = supabase.table('bots').select('*').eq('bot_username', context.bot.username).eq('is_active', True).execute()
+        bc = r.data[0] if r.data else None
+        if not bc: return
+        lang = get_user_language(uid, bc['id'])
+        context.user_data['waiting_bug'] = bc['id']
+        await update.message.reply_text(t('reportbug_ask', lang), reply_markup=ForceReply(selective=True))
+
+    @staticmethod
+    async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle text messages for coupon/recharge/transfer entry"""
+        uid = update.effective_user.id
+        text = update.message.text.strip()
+        
+        # If user types a command, clear all waiting states
+        if text.startswith('/'):
+            context.user_data.pop('waiting_coupon', None)
+            context.user_data.pop('waiting_recharge', None)
+            context.user_data.pop('waiting_transfer_amount', None)
+            context.user_data.pop('waiting_transfer_id', None)
+            context.user_data.pop('waiting_bug', None)
+            return
+        
+        # Coupon entry
+        if context.user_data.get('waiting_coupon'):
+            bot_id = context.user_data.get('waiting_coupon')
+            lang = get_user_language(uid, bot_id)
+            code = text.upper()
+            cr = supabase.table('coupons').select('*').eq('bot_id', bot_id).eq('code', code).eq('is_active', True).limit(1).execute()
+            if not cr.data:
+                # Stay in waiting state so they can retry
+                await update.message.reply_text(t('coupon_invalid', lang), reply_markup=ForceReply(selective=True))
+                return
+            c = cr.data[0]
+            # Check expiration
+            if c.get('expires_at'):
+                try:
+                    exp = datetime.fromisoformat(c['expires_at'].replace('Z', '+00:00')).replace(tzinfo=None)
+                    if exp < datetime.now():
+                        context.user_data.pop('waiting_coupon', None)
+                        await update.message.reply_text(t('coupon_expired', lang))
+                        return
+                except: pass
+            # Check max uses
+            if c.get('max_uses') and c.get('current_uses', 0) >= c['max_uses']:
+                context.user_data.pop('waiting_coupon', None)
+                await update.message.reply_text(t('coupon_max_uses', lang))
+                return
+            # Success - clear state
+            context.user_data.pop('waiting_coupon', None)
+            try:
+                supabase.table('coupon_activations').insert({
+                    'coupon_id': c['id'],
+                    'telegram_user_id': uid,
+                    'telegram_username': update.effective_user.username or "Unknown",
+                    'bot_id': bot_id
+                }).execute()
+            except: pass
+            supabase.table('user_active_coupons').upsert({
+                'telegram_user_id': uid, 'bot_id': bot_id, 'coupon_id': c['id'],
+                'created_at': datetime.now().isoformat()
+            }, on_conflict='telegram_user_id,bot_id').execute()
+            await update.message.reply_text(t('coupon_activated', lang))
+            return
+        
+        # Recharge amount entry
+        if context.user_data.get('waiting_recharge'):
+            bot_id = context.user_data.get('waiting_recharge')
+            lang = get_user_language(uid, bot_id)
+            try:
+                amount = float(text.replace(',', '.'))
+                if amount <= 0: raise ValueError()
+            except:
+                # Stay in waiting state so they can retry
+                await update.message.reply_text(t('balance_invalid_amount', lang))
+                return
+            # Success - clear state
+            context.user_data.pop('waiting_recharge', None)
+            kb = []
+            kb.append([InlineKeyboardButton(t('pay_crypto', lang), callback_data=f"rcharge_crypto_{amount:.2f}")])
+            kb.append([InlineKeyboardButton(t('pay_stars', lang), callback_data=f"rcharge_stars_{amount:.2f}")])
+            await update.message.reply_text(f"Choose payment method to add ${amount:.2f} to your balance:", reply_markup=InlineKeyboardMarkup(kb))
+            return
+        
+        # Transfer amount entry
+        if context.user_data.get('waiting_transfer_amount'):
+            bot_id = context.user_data.get('waiting_transfer_amount')
+            lang = get_user_language(uid, bot_id)
+            try:
+                amount = float(text.replace(',', '.'))
+                if amount <= 0: raise ValueError()
+            except:
+                await update.message.reply_text(t('balance_invalid_amount', lang))
+                return
+            bal = get_user_balance(uid, bot_id)
+            if bal < amount:
+                await update.message.reply_text(t('transfer_insufficient', lang))
+                return
+            # Move to next step: ask for recipient ID
+            context.user_data.pop('waiting_transfer_amount', None)
+            context.user_data['waiting_transfer_id'] = {'bot_id': bot_id, 'amount': amount}
+            await update.message.reply_text(t('transfer_prompt_id', lang))
+            return
+        
+        # Transfer recipient ID entry
+        if context.user_data.get('waiting_transfer_id'):
+            data = context.user_data.get('waiting_transfer_id')
+            bot_id = data['bot_id']
+            amount = data['amount']
+            lang = get_user_language(uid, bot_id)
+            try:
+                to_id = int(text.strip())
+            except:
+                await update.message.reply_text(t('transfer_invalid_id', lang))
+                return
+            if to_id == uid:
+                await update.message.reply_text(t('transfer_self', lang))
+                return
+            # Double check balance
+            bal = get_user_balance(uid, bot_id)
+            if bal < amount:
+                context.user_data.pop('waiting_transfer_id', None)
+                await update.message.reply_text(t('transfer_insufficient', lang))
+                return
+            # Create pending transfer
+            context.user_data.pop('waiting_transfer_id', None)
+            try:
+                supabase.table('balance_transfers').insert({
+                    'from_user_id': uid,
+                    'to_user_id': to_id,
+                    'bot_id': bot_id,
+                    'amount': amount,
+                    'status': 'pending'
+                }).execute()
+            except Exception as e:
+                logger.error(f"Error creating transfer: {e}")
+                await update.message.reply_text("Error creating transfer request.")
+                return
+            msg = t('transfer_pending', lang).replace('${amount}', f'{amount:.2f}').replace('{to_id}', str(to_id))
+            await update.message.reply_text(msg)
+            # Notify admin
+            await send_admin_notification(f"Transfer request\n\nFrom: {uid}\nTo: {to_id}\nAmount: ${amount:.2f}\nStatus: Pending approval")
+            return
+
+        # Bug report entry (text only)
+        if context.user_data.get('waiting_bug'):
+            bot_id = context.user_data.pop('waiting_bug')
+            lang = get_user_language(uid, bot_id)
+            if not text:
+                await update.message.reply_text(t('reportbug_empty', lang))
+                return
+            uname = update.effective_user.username or "Unknown"
+            br = supabase.table('bots').select('bot_username').eq('id', bot_id).limit(1).execute()
+            bot_name = br.data[0]['bot_username'] if br.data else 'Unknown'
+            report_msg = f"🐛 Bug Report\n\nBot: @{bot_name}\nUser: @{uname} ({uid})\n\n{text}"
+            if BUG_REPORT_GROUP_ID:
+                for bun, app in active_bots.items():
+                    try:
+                        await app.bot.send_message(chat_id=BUG_REPORT_GROUP_ID, text=report_msg)
+                        break
+                    except: continue
+            await update.message.reply_text(t('reportbug_sent', lang))
+            return
+
+    @staticmethod
+    async def recharge_crypto_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle crypto recharge"""
+        q = update.callback_query
+        await q.answer()
+        amount = float(q.data.replace('rcharge_crypto_', ''))
+        uid = update.effective_user.id
+        r = supabase.table('bots').select('*').eq('bot_username', context.bot.username).eq('is_active', True).execute()
+        if not r.data: return
+        bc = r.data[0]
+        lang = get_user_language(uid, bc['id'])
+        if amount < 0.10:
+            await q.message.reply_text(t('crypto_minimum', lang))
+            return
+        # Create OxaPay invoice with special order_id format for recharges
+        oid = f"rc_{bc['id'][:8]}_{uid}_{int(datetime.now().timestamp())}"
+        payload = {'amount': round(amount, 2), 'currency': 'USD', 'life_time': 30, 'fee_paid_by_payer': 1, 'under_paid_coverage': 10, 'callback_url': 'https://he.nothumxn.com/webhook/oxapay', 'return_url': 'https://t.me/', 'description': f"Balance recharge ${amount}", 'order_id': oid[:50], 'email': 'noreply@bot.com'}
+        async with aiohttp.ClientSession() as s:
+            async with s.post(OXAPAY_API_URL, json=payload, headers={'merchant_api_key': OXAPAY_MERCHANT_KEY, 'Content-Type': 'application/json'}) as resp:
+                data = await resp.json()
+                if data.get('status') == 200 or data.get('result') == 100:
+                    url = data.get('payLink') or data.get('data', {}).get('payment_url', '')
+                    kb = [[InlineKeyboardButton(t('pay_crypto', lang), url=url)]]
+                    await q.message.reply_text(f"Pay ${amount:.2f} to recharge balance:", reply_markup=InlineKeyboardMarkup(kb))
+                else:
+                    await q.message.reply_text(t('crypto_error', lang))
+
+    @staticmethod
+    async def recharge_stars_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle stars recharge - approx 1 USD = 75 stars"""
+        q = update.callback_query
+        await q.answer()
+        amount_usd = float(q.data.replace('rcharge_stars_', ''))
+        stars = max(1, int(round(amount_usd / 0.013)))  # 1 star ≈ $0.013
+        uid = update.effective_user.id
+        r = supabase.table('bots').select('*').eq('bot_username', context.bot.username).eq('is_active', True).execute()
+        if not r.data: return
+        bc = r.data[0]
+        lang = get_user_language(uid, bc['id'])
+        main_bun = bc['bot_username']
+        payload_str = f"rcharge_{bc['id']}_{uid}_{amount_usd:.2f}_{main_bun}"[:128]
+        stars_token = bc.get('stars_bot_token')
+        if stars_token:
+            try:
+                stars_bot_obj = Bot(token=stars_token)
+                link = await stars_bot_obj.create_invoice_link(
+                    title=f"Recharge ${amount_usd}",
+                    description=f"Add ${amount_usd} to your bot balance",
+                    payload=payload_str, provider_token="", currency="XTR",
+                    prices=[LabeledPrice(f"Recharge", stars)]
+                )
+                kb = [[InlineKeyboardButton(f"⭐ Pay {stars} ⭐", url=link)]]
+                await q.message.reply_text(f"Recharge ${amount_usd} with {stars} Stars:", reply_markup=InlineKeyboardMarkup(kb))
+                return
+            except Exception as e:
+                logger.error(f"Error creating stars recharge link: {e}")
+        await context.bot.send_invoice(chat_id=uid, title=f"Recharge ${amount_usd}", description=f"Add ${amount_usd} to balance", payload=payload_str, provider_token="", currency="XTR", prices=[LabeledPrice("Recharge", stars)])
+
+    @staticmethod
+    async def pay_with_balance_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show confirmation before paying with balance"""
+        q = update.callback_query
+        await q.answer()
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except: pass
+        uid = update.effective_user.id
+        raw = q.data.replace('paybal_', '')
+        if len(raw) > 36:
+            product_id = raw[:36]
+            plan_short = raw[37:]
+        else:
+            product_id = raw
+            plan_short = None
+        
+        r = supabase.table('products').select('*').eq('id', product_id).execute()
+        if not r.data: return
+        p = r.data[0]
+        lang = get_user_language(uid, p['bot_id'])
+        plan = find_plan_by_short(plan_short, product_id) if plan_short else None
+        price = float(plan['price']) if plan else float(p['price'])
+        
+        coupon = get_active_coupon(uid, p['bot_id'])
+        price, coupon_applied = apply_coupon_discount(price, coupon, 'paypal', p)
+        
+        bal = get_user_balance(uid, p['bot_id'])
+        if bal < price:
+            msg = t('balance_insufficient', lang).replace('${current}', f'{bal:.2f}').replace('${needed}', f'{price - bal:.2f}')
+            await q.message.reply_text(msg)
+            return
+        
+        cb_yes = f"paybalok_{product_id}"
+        if plan_short: cb_yes += f"_{plan_short}"
+        
+        msg = f"*{t('balance_confirm', lang)}*\n\n"
+        msg += f"{p['product_name']}\n"
+        if plan: msg += f"Plan: {plan['plan_name']}\n"
+        msg += f"*{t('price_label', lang)}* ${price:.2f}\n"
+        msg += f"*{t('balance_current', lang)}* ${bal:.2f}\n"
+        msg += f"*{t('balance_after', lang)}* ${bal - price:.2f}\n"
+        
+        kb = [
+            [InlineKeyboardButton(t('confirm_yes', lang), callback_data=cb_yes[:64])],
+            [InlineKeyboardButton(t('confirm_no', lang), callback_data='cancel_purchase')]
+        ]
+        await q.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+
+    @staticmethod
+    async def pay_with_balance_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Process confirmed balance payment"""
+        q = update.callback_query
+        await q.answer()
+        # Remove buttons immediately to prevent double-click
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except: pass
+        uid = update.effective_user.id
+        uname = update.effective_user.username or "Unknown"
+        raw = q.data.replace('paybalok_', '')
+        if len(raw) > 36:
+            product_id = raw[:36]
+            plan_short = raw[37:]
+        else:
+            product_id = raw
+            plan_short = None
+        
+        r = supabase.table('products').select('*').eq('id', product_id).execute()
+        if not r.data: return
+        p = r.data[0]
+        bot_id = p['bot_id']
+        lang = get_user_language(uid, bot_id)
+        plan = find_plan_by_short(plan_short, product_id) if plan_short else None
+        price = float(plan['price']) if plan else float(p['price'])
+        
+        coupon = get_active_coupon(uid, bot_id)
+        price, coupon_applied = apply_coupon_discount(price, coupon, 'paypal', p)
+        
+        # Check if user already has access BEFORE charging
+        ex = supabase.table('sales').select('id').eq('telegram_user_id', uid).eq('product_id', product_id).eq('status', 'completed').execute()
+        if ex.data:
+            if plan:
+                active_sub = supabase.table('user_subscriptions').select('id').eq('telegram_user_id', uid).eq('product_id', product_id).eq('status', 'active').execute()
+                if active_sub.data:
+                    await q.message.reply_text(t('already_access', lang))
+                    return
+            else:
+                await q.message.reply_text(t('already_access', lang))
+                return
+        
+        bal = get_user_balance(uid, bot_id)
+        if bal < price:
+            msg = t('balance_insufficient', lang).replace('${current}', f'{bal:.2f}').replace('${needed}', f'{price - bal:.2f}')
+            await q.message.reply_text(msg)
+            return
+        
+        new_bal = add_balance_transaction(uid, bot_id, -price, 'purchase', reference=f"BALANCE_{product_id[:8]}_{int(datetime.now().timestamp())}", description=f"Purchase: {p['product_name']}")
+        if new_bal is None:
+            await q.message.reply_text("Error processing payment.")
+            return
+        
+        br = supabase.table('bots').select('*').eq('id', bot_id).execute()
+        bc = br.data[0] if br.data else {}
+        await BotManager.deliver_purchase(bc.get('bot_username', context.bot.username), uid, p, bc, plan, uname)
+        
+        supabase.table('sales').insert({
+            'bot_id': bot_id, 'product_id': p['id'], 'telegram_user_id': uid,
+            'telegram_username': uname, 'hotmart_transaction_id': f"BALANCE_{int(datetime.now().timestamp())}", 'payment_method': 'Balance',
+            'amount': price, 'status': 'completed'
+        }).execute()
+        
+        if coupon_applied and coupon:
+            redeem_coupon(uid, bot_id, coupon['id'])
+        
+        await send_sale_notification(p['product_name'], price, p.get('currency', 'USD'), 'Balance', uid, uname, plan['plan_name'] if plan else None)
+        msg = t('balance_paid', lang).replace('${balance}', f'{(new_bal or 0):.2f}')
+        await q.message.reply_text(msg)
+
+    @staticmethod
+    async def cancel_purchase_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        await q.answer()
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except: pass
+        lang = get_user_language(update.effective_user.id, '')
+        await q.message.reply_text(t('purchase_cancelled', lang))
+
+    @staticmethod
+    async def product_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        await q.answer()
+        # Clear any waiting states
+        for k in ['waiting_coupon', 'waiting_recharge', 'waiting_transfer_amount', 'waiting_transfer_id', 'waiting_bug']:
+            context.user_data.pop(k, None)
+        uid = update.effective_user.id
+        uname = update.effective_user.username or "Unknown"
+        pid = q.data.replace('product_', '')
+        pr = supabase.table('products').select('*').eq('id', pid).execute()
+        if not pr.data:
+            await q.message.reply_text("Product not found.")
+            return
+        product = pr.data[0]
+        bot_id = product['bot_id']
+        # Debug: log payment method flags
+        logger.info(f"Product {product['product_name']}: enable_hotmart={product.get('enable_hotmart')}, enable_crypto={product.get('enable_crypto')}, enable_telegram_stars={product.get('enable_telegram_stars')}, enable_manual={product.get('enable_manual')}, enabled_manual_methods={product.get('enabled_manual_methods')}")
+        # Block banned users
+        if is_user_banned(uid, bot_id):
+            return
+        lang = get_user_language(uid, bot_id)
+        ex = supabase.table('sales').select('id').eq('telegram_user_id', uid).eq('product_id', pid).eq('status', 'completed').execute()
+        if ex.data:
+            # Check if this is a subscription product with expired subscription
+            plans = get_subscription_plans(pid)
+            if plans:
+                active_sub = supabase.table('user_subscriptions').select('id').eq('telegram_user_id', uid).eq('product_id', pid).eq('status', 'active').execute()
+                if not active_sub.data:
+                    pass  # Subscription expired, allow re-purchase
+                else:
+                    await q.message.reply_text(t('already_purchased', lang))
+                    return
+            else:
+                await q.message.reply_text(t('already_purchased', lang))
+                return
+        ts = int(time.time() * 1000)
+        sck = f"tg_{uid}_{pid}_{ts}"
+        try: supabase.table('pending_purchases').insert({'telegram_user_id': uid, 'telegram_username': uname, 'product_id': pid, 'bot_id': bot_id, 'status': 'pending'}).execute()
+        except: pass
+        
+        # Check if product has subscription plans
+        plans = get_subscription_plans(pid)
+        
+        if plans:
+            # Subscription product: just show choose your plan
+            cap = t('select_plan', lang)
+            kb = []
+            for plan in plans:
+                dur = format_duration(plan.get('duration_minutes', 0))
+                dur_text = f" ({dur})" if dur else f" ({t('permanent', lang)})"
+                btn = f"{plan['plan_name']}{dur_text} - ${plan['price']} {plan.get('currency', 'USD')}"
+                kb.append([InlineKeyboardButton(btn, callback_data=f"plan_{pid}_{plan['id'][:8]}")])
+        else:
+            # Non-subscription product: show full info
+            cap = f"*{t('full_access', lang)}*\n"
+            cap += f"*{t('price_label', lang)}* ${product['price']} {product.get('currency', 'USD')}\n"
+            cap += f"*{t('duration_label', lang)}* {t('forever', lang)}\n"
+            if product.get('product_description'):
+                cap += f"\n{product['product_description']}\n"
+            cap += f"\n{t('no_refunds', lang)}"
+            kb = build_payment_buttons(product, sck, lang, bot_id, uid)
+        
+        rm = InlineKeyboardMarkup(kb) if kb else None
+        if product.get('video_url'):
+            await q.message.reply_video(video=product['video_url'], caption=cap, reply_markup=rm, supports_streaming=True, width=1280, height=720, parse_mode='Markdown')
+        elif product.get('image_url'):
+            await q.message.reply_photo(photo=product['image_url'], caption=cap, reply_markup=rm, parse_mode='Markdown')
+        else:
+            await q.message.reply_text(cap, reply_markup=rm, parse_mode='Markdown')
+
+    @staticmethod
+    async def plan_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle plan selection - show payment methods for that plan"""
+        q = update.callback_query
+        await q.answer()
+        # Clear any waiting states
+        for k in ['waiting_coupon', 'waiting_recharge', 'waiting_transfer_amount', 'waiting_transfer_id', 'waiting_bug']:
+            context.user_data.pop(k, None)
+        raw = q.data.replace('plan_', '')
+        product_id = raw[:36]
+        plan_short = raw[37:]
+        uid = update.effective_user.id
+        
+        pr = supabase.table('products').select('*').eq('id', product_id).execute()
+        if not pr.data:
+            await q.message.reply_text("Product not found.")
+            return
+        product = pr.data[0]
+        lang = get_user_language(uid, product['bot_id'])
+        
+        plan = find_plan_by_short(plan_short, product_id)
+        if not plan:
+            logger.error(f"Plan not found: short={plan_short}, product={product_id}, raw={raw}")
+            await q.message.reply_text("Plan not found.")
+            return
+        
+        # Save selected plan in user_data
+        context.user_data['selected_plan_id'] = plan['id']
+        
+        ts = int(time.time() * 1000)
+        sck = f"tg_{uid}_{product_id}_{ts}"
+        
+        kb = build_payment_buttons_for_plan(product, plan, sck, lang, product['bot_id'], uid)
+        rm = InlineKeyboardMarkup(kb) if kb else None
+        
+        dur = format_duration(plan.get('duration_minutes', 0))
+        dur_text = dur if dur else t('forever', lang)
+        msg = f"*{t('full_access', lang)}*\n"
+        msg += f"*{t('price_label', lang)}* ${plan['price']} {plan.get('currency', 'USD')}\n"
+        msg += f"*{t('duration_label', lang)}* {dur_text}\n"
+        if product.get('product_description'):
+            msg += f"\n{product['product_description']}\n"
+        msg += f"\n{t('no_refunds', lang)}"
+        await q.message.reply_text(msg, reply_markup=rm, parse_mode='Markdown')
+
+    @staticmethod
+    async def manual_method_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        await q.answer()
+        raw = q.data[3:]  # remove 'mm_'
+        product_id = raw[:36]
+        rest = raw[37:]
+        # rest could be: short_method OR short_method_short_plan
+        parts = rest.split('_')
+        short_mid = parts[0]
+        plan_short = parts[1] if len(parts) > 1 else None
+        
+        uid = update.effective_user.id
+        pr = supabase.table('products').select('*').eq('id', product_id).execute()
+        if not pr.data: return
+        product = pr.data[0]
+        method = find_method_by_short(short_mid)
+        if not method: return
+        plan = find_plan_by_short(plan_short, product_id) if plan_short else None
+        
+        lang = get_user_language(uid, product['bot_id'])
+        price = float(plan['price']) if plan else float(product['price'])
+        cur = product.get('currency', 'USD')
+        # Apply coupon (skip if method excludes coupons)
+        coupon = get_active_coupon(uid, product['bot_id'])
+        orig_price = price
+        if method.get('exclude_from_coupons'):
+            price, applied = price, False
+        else:
+            price, applied = apply_coupon_discount(price, coupon, 'paypal', product)
+        
+        msg = f"💰 **{method['method_name']}**\n\n"
+        if plan:
+            msg += f"Plan: {plan['plan_name']}\n"
+        if applied:
+            msg += f"~~${orig_price:.2f} {cur}~~\n**${price:.2f} {cur}** ({t('coupon_applied', lang)} {coupon['code']})\n\n"
+        else:
+            msg += f"**${price:.2f} {cur}**\n\n"
+        msg += f"{method.get('payment_details', '')}\n\n"
+        msg += f"{t('important_exact', lang, price=f'{price:.2f}', currency=cur)}\n\n"
+        # Generate random safe note for methods that require it
+        if method.get('require_random_note'):
+            note_word = random.choice(PAYPAL_SAFE_NOTES)
+            msg += f"📝 {t('paypal_note', lang)}: {note_word}\n\n"
+            context.user_data['mp_required_note'] = note_word
+        msg += f"{t('no_refunds', lang)}\n\n{t('after_payment_proof', lang)}"
+        
+        kb = []
+        if method.get('payment_url'):
+            kb.append([InlineKeyboardButton(t('pay_link', lang), url=method['payment_url'])])
+        sp_cb = f"sp_{product_id}_{short_mid}"
+        if plan_short: sp_cb += f"_{plan_short}"
+        kb.append([InlineKeyboardButton(t('pay_already', lang), callback_data=sp_cb[:64])])
+        await q.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+
+    @staticmethod
+    async def crypto_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        await q.answer()
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except: pass
+        raw = q.data.replace('crypto_', '')
+        # crypto_{product_id} OR crypto_{product_id}_{plan_short}
+        if len(raw) > 36:
+            product_id = raw[:36]
+            plan_short = raw[37:]
+        else:
+            product_id = raw
+            plan_short = None
+        uid = update.effective_user.id
+        r = supabase.table('products').select('*').eq('id', product_id).execute()
+        if not r.data: return
+        p = r.data[0]
+        lang = get_user_language(uid, p['bot_id'])
+        
+        plan = find_plan_by_short(plan_short, product_id) if plan_short else None
+        # Plan-specific crypto price, fallback to plan price or product crypto price
+        if plan:
+            price = float(plan.get('crypto_price_usd') or plan.get('price') or 0)
+        else:
+            price = float(p.get('crypto_price_usd', 0) or p.get('price', 0))
+        
+        if not price:
+            await q.message.reply_text(t('crypto_not_configured', lang))
+            return
+        # Apply coupon
+        coupon = get_active_coupon(uid, p['bot_id'])
+        orig_price = price
+        price, applied = apply_coupon_discount(price, coupon, 'crypto', p)
+        if price < 0.10:
+            await q.message.reply_text(t('crypto_minimum', lang))
+            return
+        url = await create_oxapay_invoice(price, product_id, uid, p['product_name'], plan['id'] if plan else None)
+        if not url:
+            await q.message.reply_text(t('crypto_error', lang))
+            return
+        msg = f"{t('crypto_payment_title', lang)}\n\n{t('crypto_product', lang)} {p['product_name']}\n"
+        if plan: msg += f"Plan: {plan['plan_name']}\n"
+        if applied:
+            msg += f"~~${orig_price:.2f} USD~~\n*${price:.2f} USD* ({t('coupon_applied', lang)} {coupon['code']})\n\n"
+        else:
+            msg += f"{t('crypto_amount', lang)} ${price} USD\n\n"
+        msg += f"{t('crypto_payment_info', lang)}\n\n{t('no_refunds', lang)}\n\n{t('crypto_after_payment', lang)}"
+        await q.message.reply_text(msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(t('pay_crypto', lang), url=url)]]), parse_mode='Markdown')
+
+    @staticmethod
+    async def stars_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        await q.answer()
+        raw = q.data.replace('stars_', '')
+        if len(raw) > 36:
+            product_id = raw[:36]
+            plan_short = raw[37:]
+        else:
+            product_id = raw
+            plan_short = None
+        uid = update.effective_user.id
+        r = supabase.table('products').select('*').eq('id', product_id).execute()
+        if not r.data: return
+        p = r.data[0]
+        lang = get_user_language(uid, p['bot_id'])
+        plan = find_plan_by_short(plan_short, product_id) if plan_short else None
+        # Plan-specific stars price, fallback to product
+        sp = (plan.get('telegram_stars_price') if plan else None) or p.get('telegram_stars_price', 0)
+        if not sp:
+            await q.message.reply_text(t('stars_not_configured', lang))
+            return
+        # Apply coupon
+        coupon = get_active_coupon(uid, p['bot_id'])
+        orig_sp = sp
+        sp_f, applied = apply_coupon_discount(float(sp), coupon, 'stars', p)
+        sp = max(1, int(round(sp_f)))
+        desc = (p.get('product_description') or p['product_name']) + f"\n\n{t('no_refunds', lang)}"
+        bot_config_r = supabase.table('bots').select('*').eq('id', p['bot_id']).limit(1).execute()
+        bot_config = bot_config_r.data[0] if bot_config_r.data else {}
+        main_bun = bot_config.get('bot_username', context.bot.username)
+        plan_part = plan['id'][:8] if plan else "NONE"
+        payload_str = f"stars_{product_id}_{plan_part}_{uid}_{main_bun}"[:128]
+        
+        stars_token = p.get('stars_bot_token') or bot_config.get('stars_bot_token')
+        if stars_token:
+            try:
+                stars_bot_obj = Bot(token=stars_token)
+                link = await stars_bot_obj.create_invoice_link(
+                    title=p['product_name'][:32],
+                    description=desc[:255],
+                    payload=payload_str,
+                    provider_token="",
+                    currency="XTR",
+                    prices=[LabeledPrice(p['product_name'][:32], sp)]
+                )
+                kb = [[InlineKeyboardButton(f"⭐ {t('pay_stars', lang)} ({sp} ⭐)", url=link)]]
+                msg = f"⭐ **Telegram Stars**\n\n{p['product_name']}"
+                if plan: msg += f" — {plan['plan_name']}"
+                await q.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+                return
+            except Exception as e:
+                logger.error(f"Error creating stars invoice link: {e}")
+        
+        await context.bot.send_invoice(chat_id=uid, title=p['product_name'][:32], description=desc[:255], payload=payload_str, provider_token="", currency="XTR", prices=[LabeledPrice(p['product_name'][:32], sp)])
+
+    @staticmethod
+    async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.pre_checkout_query.answer(ok=True)
+
+    @staticmethod
+    async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        pay = update.message.successful_payment
+        parts = pay.invoice_payload.split('_')
+        uname = update.effective_user.username or "Unknown"
+        
+        # Handle balance recharge: rcharge_{bot_id}_{uid}_{amount}_{main_bun}
+        if parts[0] == 'rcharge':
+            bot_id = parts[1]
+            tid = int(parts[2])
+            amount = float(parts[3])
+            br = supabase.table('bots').select('*').eq('id', bot_id).execute()
+            bot_config = br.data[0] if br.data else {}
+            ref = f"STARS_RECHARGE_{pay.telegram_payment_charge_id}"
+            ex = supabase.table('balance_transactions').select('id').eq('reference', ref).execute()
+            if not ex.data:
+                add_balance_transaction(tid, bot_id, amount, 'recharge', reference=ref, description=f"Stars recharge ({pay.total_amount} ⭐)")
+                if bot_config.get('bot_username') in active_bots:
+                    try:
+                        lang = get_user_language(tid, bot_id)
+                        new_bal = get_user_balance(tid, bot_id)
+                        await active_bots[bot_config['bot_username']].bot.send_message(chat_id=tid, text=t('balance_recharged', lang, balance=f"{new_bal:.2f}"))
+                    except: pass
+                await send_admin_notification(f"Balance recharge\n\nUser ID: {tid}\nAmount: ${amount}\nStars: {pay.total_amount} ⭐\nMethod: Stars")
+            return
+        
+        # Normal product purchase: stars_{pid}_{plan_or_NONE}_{uid}_{main_bun}
+        plan_short = None
+        main_bun = None
+        pid = parts[1]
+        if len(parts) >= 5:
+            plan_short = parts[2] if parts[2] != 'NONE' else None
+            tid = int(parts[3])
+            main_bun = '_'.join(parts[4:])
+        elif len(parts) == 4:
+            plan_short = parts[2] if parts[2] != 'NONE' else None
+            tid = int(parts[3])
+        else:
+            tid = int(parts[2])
+        
+        pr = supabase.table('products').select('*').eq('id', pid).execute()
+        if not pr.data: return
+        p = pr.data[0]
+        br = supabase.table('bots').select('*').eq('id', p['bot_id']).execute()
+        if not br.data: return
+        bc = br.data[0]
+        plan = find_plan_by_short(plan_short, pid) if plan_short else None
+        
+        active_coupon = get_active_coupon(tid, bc['id'])
+        
+        target_bun = main_bun or bc['bot_username']
+        await BotManager.deliver_purchase(target_bun, tid, p, bc, plan, uname)
+        supabase.table('sales').insert({'bot_id': p['bot_id'], 'product_id': p['id'], 'telegram_user_id': tid, 'telegram_username': uname, 'hotmart_transaction_id': f"STARS_{pay.telegram_payment_charge_id}", 'payment_method': 'Stars', 'amount': p['price'], 'status': 'completed'}).execute()
+        await send_sale_notification(p['product_name'], p['price'], p.get('currency', 'USD'), 'Stars', tid, uname, plan['plan_name'] if plan else None, stars_amount=pay.total_amount)
+        if active_coupon:
+            redeem_coupon(tid, bc['id'], active_coupon['id'], sale_reference=f"STARS_{pay.telegram_payment_charge_id}")
+
+    @staticmethod
+    async def submit_proof_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        await q.answer()
+        raw = q.data[3:]  # remove 'sp_'
+        product_id = raw[:36]
+        rest = raw[37:]
+        parts = rest.split('_')
+        short_mid = parts[0]
+        plan_short = parts[1] if len(parts) > 1 else None
+        uid = update.effective_user.id
+        
+        pr = supabase.table('products').select('bot_id').eq('id', product_id).limit(1).execute()
+        bot_id = pr.data[0]['bot_id'] if pr.data else ''
+        lang = get_user_language(uid, bot_id)
+        method = find_method_by_short(short_mid)
+        
+        context.user_data.update({
+            'mp_product_id': product_id, 'mp_uid': uid,
+            'mp_uname': update.effective_user.username or "Unknown",
+            'mp_lang': lang, 'mp_method': method.get('method_name', 'Manual') if method else 'Manual',
+            'mp_req_email': method.get('requires_email', True) if method else True,
+            'mp_req_trans': method.get('requires_transaction_id', True) if method else True,
+            'mp_req_code': method.get('requires_code', False) if method else False,
+            'mp_plan_id': None, 'mp_step': 'start', 'mp_email': 'n/a', 'mp_transaction': 'n/a', 'mp_code': 'n/a',
+        })
+        if plan_short:
+            plan = find_plan_by_short(plan_short, product_id)
+            if plan: context.user_data['mp_plan_id'] = plan['id']
+        state, msg = next_step(context, lang)
+        await q.message.reply_text(msg, reply_markup=ForceReply(selective=True))
+        return state
+
+    @staticmethod
+    async def receive_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        email = update.message.text.strip()
+        lang = context.user_data.get('mp_lang', 'en')
+        if email.startswith('/'):
+            context.user_data.clear()
+            await update.message.reply_text(t('purchase_cancelled', lang), reply_markup=ReplyKeyboardRemove())
+            return ConversationHandler.END
+        if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
+            await update.message.reply_text(t('invalid_email', lang), reply_markup=ForceReply(selective=True))
+            return WAITING_EMAIL
+        context.user_data['mp_email'] = email
+        context.user_data['mp_step'] = 'email'
+        state, msg = next_step(context, lang)
+        await update.message.reply_text(msg, reply_markup=ForceReply(selective=True))
+        return state
+
+    @staticmethod
+    async def receive_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        lang = context.user_data.get('mp_lang', 'en')
+        text = update.message.text.strip()
+        if text.startswith('/') or len(text) < 2:
+            context.user_data.clear()
+            await update.message.reply_text(t('purchase_cancelled', lang), reply_markup=ReplyKeyboardRemove())
+            return ConversationHandler.END
+        context.user_data['mp_transaction'] = text
+        context.user_data['mp_step'] = 'transaction'
+        state, msg = next_step(context, lang)
+        await update.message.reply_text(msg, reply_markup=ForceReply(selective=True))
+        return state
+
+    @staticmethod
+    async def receive_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        lang = context.user_data.get('mp_lang', 'en')
+        text = update.message.text.strip()
+        if text.startswith('/') or len(text) < 2:
+            context.user_data.clear()
+            await update.message.reply_text(t('purchase_cancelled', lang), reply_markup=ReplyKeyboardRemove())
+            return ConversationHandler.END
+        context.user_data['mp_code'] = text
+        context.user_data['mp_step'] = 'code'
+        state, msg = next_step(context, lang)
+        await update.message.reply_text(msg, reply_markup=ForceReply(selective=True))
+        return state
+
+    @staticmethod
+    async def receive_proof(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        lang = context.user_data.get('mp_lang', 'en')
+        logger.info(f"receive_proof called, photo={bool(update.message.photo)}, doc={bool(update.message.document)}")
+        if update.message.photo:
+            f = await update.message.photo[-1].get_file()
+        elif update.message.document:
+            f = await update.message.document.get_file()
+        else:
+            await update.message.reply_text(t('invalid_proof', lang))
+            return WAITING_PROOF
+        try:
+            insert_data = {
+                'product_id': context.user_data['mp_product_id'],
+                'telegram_user_id': context.user_data['mp_uid'],
+                'telegram_username': context.user_data['mp_uname'],
+                'email': context.user_data.get('mp_email', 'n/a'),
+                'transaction_id': context.user_data.get('mp_code', '') or context.user_data.get('mp_transaction', 'n/a'),
+                'payment_proof_url': f.file_path, 'status': 'pending'
+            }
+            plan_id = context.user_data.get('mp_plan_id')
+            if plan_id:
+                insert_data['plan_id'] = plan_id
+            supabase.table('manual_payments').insert(insert_data).execute()
+            await update.message.reply_text(t('proof_submitted', lang), reply_markup=ReplyKeyboardRemove())
+            logger.info(f"Payment proof submitted by {context.user_data.get('mp_uid')}")
+        except Exception as e:
+            logger.error(f"Error saving manual payment: {e}", exc_info=True)
+            await update.message.reply_text(t('proof_error', lang))
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    @staticmethod
+    async def cancel_proof_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """User sent text instead of photo during proof step - remind them"""
+        lang = context.user_data.get('mp_lang', 'en')
+        text = update.message.text.strip()
+        if text.startswith('/'):
+            context.user_data.clear()
+            await update.message.reply_text(t('purchase_cancelled', lang), reply_markup=ReplyKeyboardRemove())
+            return ConversationHandler.END
+        await update.message.reply_text(t('send_proof', lang), reply_markup=ForceReply(selective=True))
+        return WAITING_PROOF
+
+    @staticmethod
+    async def deliver_purchase(bot_username, tid, product, bc, plan, uname):
+        """Deliver purchase: auto-generated invite link if channel_chat_id exists, else invite codes"""
+        try:
+            if bot_username not in active_bots: return False
+            a = active_bots[bot_username]
+            lang = get_user_language(tid, bc['id'])
+            ex = supabase.table('sales').select('id').eq('telegram_user_id', tid).eq('product_id', product['id']).eq('status', 'completed').execute()
+            if ex.data:
+                # For subscription products, check if subscription is still active
+                if plan:
+                    active_sub = supabase.table('user_subscriptions').select('id').eq('telegram_user_id', tid).eq('product_id', product['id']).eq('status', 'active').execute()
+                    if not active_sub.data:
+                        pass  # Subscription expired, allow re-purchase
+                    else:
+                        await a.bot.send_message(chat_id=tid, text=t('already_access', lang))
+                        return True
+                else:
+                    await a.bot.send_message(chat_id=tid, text=t('already_access', lang))
+                    return True
+            
+            invite_link = None
+            
+            if product.get('channel_chat_id'):
+                # Auto-generate invite link (works for both subscriptions and one-time purchases)
+                invite_link = await generate_invite_link(bc, product, tid, uname)
+                if not invite_link:
+                    await a.bot.send_message(chat_id=tid, text=t('invite_error', lang))
+                    return False
+                
+                if plan:
+                    # Subscription: save with expiration
+                    duration = plan.get('duration_minutes', 0)
+                    expires_at = None if not duration else (datetime.now() + timedelta(minutes=duration))
+                    sub_data = {
+                        'telegram_user_id': tid,
+                        'telegram_username': uname,
+                        'product_id': product['id'],
+                        'bot_id': bc['id'],
+                        'plan_id': plan['id'],
+                        'invite_link': invite_link,
+                        'expires_at': expires_at.isoformat() if expires_at else None,
+                        'status': 'active'
+                    }
+                    try:
+                        supabase.table('user_subscriptions').insert(sub_data).execute()
+                    except Exception as e:
+                        logger.error(f"Error saving subscription: {e}")
+                    exp_text = expires_at.strftime('%Y-%m-%d %H:%M UTC') if expires_at else t('permanent', lang)
+                    msg = t('subscription_message', lang, plan_name=plan['plan_name'], expires=exp_text, invite_link=invite_link)
+                    await a.bot.send_message(chat_id=tid, text=msg)
+                else:
+                    # One-time purchase with auto invite link - save link for /myaccess
+                    try:
+                        supabase.table('user_subscriptions').insert({
+                            'telegram_user_id': tid, 'telegram_username': uname,
+                            'product_id': product['id'], 'bot_id': bc['id'],
+                            'invite_link': invite_link, 'status': 'active'
+                        }).execute()
+                    except Exception as e:
+                        logger.error(f"Error saving invite link for one-time purchase: {e}")
+                    await a.bot.send_message(chat_id=tid, text=t('purchase_message', lang).replace('{invite_link}', invite_link))
+                return True
+            
+            # Fallback to invite_codes (no channel_chat_id)
+            icr = supabase.table('invite_codes').select('*').eq('product_id', product['id']).eq('is_used', False).limit(1).execute()
+            if icr.data:
+                ic = icr.data[0]
+                invite_link = ic['code']
+                supabase.table('invite_codes').update({'is_used': True, 'used_by_telegram_user_id': tid, 'used_at': datetime.now().isoformat()}).eq('id', ic['id']).execute()
+            else:
+                invite_link = product.get('invite_link')
+            
+            if not invite_link:
+                await a.bot.send_message(chat_id=tid, text=t('invite_error', lang))
+                return False
+            
+            await a.bot.send_message(chat_id=tid, text=t('purchase_message', lang).replace('{invite_link}', invite_link))
+            return True
+        except Exception as e:
+            logger.error(f"Error delivering purchase: {e}")
+            return False
+
+    @staticmethod
+    async def start_bot(token, bun):
+        try:
+            application = Application.builder().token(token).build()
+            conv = ConversationHandler(
+                entry_points=[CallbackQueryHandler(BotManager.submit_proof_callback, pattern='^sp_')],
+                states={
+                    WAITING_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, BotManager.receive_email)],
+                    WAITING_TRANSACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, BotManager.receive_transaction)],
+                    WAITING_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, BotManager.receive_code)],
+                    WAITING_PROOF: [
+                        MessageHandler((filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND, BotManager.receive_proof),
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, BotManager.cancel_proof_text),
+                    ],
+                },
+                fallbacks=[
+                    CommandHandler('cancel', BotManager.cancel_command),
+                    CommandHandler('start', BotManager.cancel_conv),
+                    CommandHandler('language', BotManager.cancel_conv),
+                    CommandHandler('help', BotManager.cancel_conv),
+                    CommandHandler('myaccess', BotManager.cancel_conv),
+                    CommandHandler('coupon', BotManager.cancel_conv),
+                    CommandHandler('recharge', BotManager.cancel_conv),
+                    CommandHandler('transfer', BotManager.cancel_conv),
+                    CommandHandler('myid', BotManager.cancel_conv),
+                    CommandHandler('reportbug', BotManager.cancel_conv),
+                    MessageHandler(filters.COMMAND, BotManager.cancel_conv),
+                ],
+                allow_reentry=True,
+                conversation_timeout=600,
+            )
+            application.add_handler(conv)
+            application.add_handler(CommandHandler("start", BotManager.start_command))
+            application.add_handler(CommandHandler("language", BotManager.language_command))
+            application.add_handler(CommandHandler("help", BotManager.help_command))
+            application.add_handler(CommandHandler("myaccess", BotManager.myaccess_command))
+            application.add_handler(CommandHandler("coupon", BotManager.coupon_command))
+            application.add_handler(CommandHandler("recharge", BotManager.recharge_command))
+            application.add_handler(CommandHandler("transfer", BotManager.transfer_command))
+            application.add_handler(CommandHandler("myid", BotManager.myid_command))
+            application.add_handler(CommandHandler("reportbug", BotManager.reportbug_command))
+            application.add_handler(CommandHandler("cancel", BotManager.cancel_command))
+            application.add_handler(CallbackQueryHandler(BotManager.recharge_crypto_callback, pattern='^rcharge_crypto_'))
+            application.add_handler(CallbackQueryHandler(BotManager.recharge_stars_callback, pattern='^rcharge_stars_'))
+            application.add_handler(CallbackQueryHandler(BotManager.pay_with_balance_callback, pattern='^paybal_'))
+            application.add_handler(CallbackQueryHandler(BotManager.pay_with_balance_confirm, pattern='^paybalok_'))
+            application.add_handler(CallbackQueryHandler(BotManager.cancel_purchase_callback, pattern='^cancel_purchase'))
+            application.add_handler(CallbackQueryHandler(BotManager.language_callback, pattern='^lang_'))
+            application.add_handler(CallbackQueryHandler(BotManager.product_callback, pattern='^product_'))
+            application.add_handler(CallbackQueryHandler(BotManager.category_callback, pattern='^cat_'))
+            application.add_handler(CallbackQueryHandler(BotManager.back_to_products_callback, pattern='^back_to_products'))
+            application.add_handler(CallbackQueryHandler(BotManager.plan_callback, pattern='^plan_'))
+            application.add_handler(CallbackQueryHandler(BotManager.manual_method_callback, pattern='^mm_'))
+            application.add_handler(CallbackQueryHandler(BotManager.stars_payment_callback, pattern='^stars_'))
+            application.add_handler(CallbackQueryHandler(BotManager.crypto_payment_callback, pattern='^crypto_'))
+            application.add_handler(PreCheckoutQueryHandler(BotManager.precheckout_callback))
+            application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, BotManager.successful_payment_callback))
+            # Text handler for /coupon and /recharge flows (added LAST so conv has priority)
+            application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, BotManager.text_message_handler))
+            active_bots[bun] = application
+            await application.initialize(); await application.start(); await application.updater.start_polling()
+            logger.info(f"Bot @{bun} started")
+        except Exception as e:
+            logger.error(f"Error starting @{bun}: {e}")
+
+    @staticmethod
+    async def start_stars_bot(token, bun, main_bun):
+        """Start a minimal bot that only processes Stars payments"""
+        try:
+            if bun in stars_bots: return
+            application = Application.builder().token(token).build()
+            stars_to_main[bun] = main_bun
+            
+            async def stars_precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+                await update.pre_checkout_query.answer(ok=True)
+            
+            async def stars_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+                try:
+                    pay = update.message.successful_payment
+                    logger.info(f"Stars payment received: payload={pay.invoice_payload}, amount={pay.total_amount}")
+                    parts = pay.invoice_payload.split('_')
+                    uname = update.effective_user.username or "Unknown"
+                    plan_short = None
+                    main_bun = None
+                    # Payload format: stars_{product_id}_{plan_short}_{tid}_{main_bun}
+                    # product_id uses hyphens not underscores, but bot username can have underscores
+                    # So we parse by known positions
+                    prefix = parts[0]  # 'stars'
+                    pid = parts[1]     # product UUID (no underscores)
+                    if len(parts) >= 5:
+                        plan_short = parts[2] if parts[2] != 'NONE' else None
+                        tid = int(parts[3])
+                        # Everything from parts[4] onwards is the bot username (may contain underscores)
+                        main_bun = '_'.join(parts[4:])
+                    elif len(parts) == 4:
+                        plan_short = parts[2] if parts[2] != 'NONE' else None
+                        tid = int(parts[3])
+                    else:
+                        tid = int(parts[2])
+                    
+                    logger.info(f"Stars parsed: pid={pid}, tid={tid}, plan={plan_short}, main_bun={main_bun}")
+                    
+                    pr = supabase.table('products').select('*').eq('id', pid).execute()
+                    if not pr.data:
+                        logger.error(f"Stars: product not found for pid={pid}")
+                        return
+                    p = pr.data[0]
+                    br = supabase.table('bots').select('*').eq('id', p['bot_id']).execute()
+                    if not br.data:
+                        logger.error(f"Stars: bot not found for bot_id={p['bot_id']}")
+                        return
+                    bc = br.data[0]
+                    plan = find_plan_by_short(plan_short, pid) if plan_short else None
+                    target_bun = main_bun or bc['bot_username']
+                    logger.info(f"Stars delivering to {target_bun} for user {tid}")
+                    ok = await BotManager.deliver_purchase(target_bun, tid, p, bc, plan, uname)
+                    logger.info(f"Stars delivery result: ok={ok}")
+                    supabase.table('sales').insert({'bot_id': p['bot_id'], 'product_id': p['id'], 'telegram_user_id': tid, 'telegram_username': uname, 'hotmart_transaction_id': f"STARS_{pay.telegram_payment_charge_id}", 'payment_method': 'Stars', 'amount': p['price'], 'status': 'completed'}).execute()
+                    await send_sale_notification(p['product_name'], p['price'], p.get('currency', 'USD'), 'Stars', tid, uname, plan['plan_name'] if plan else None, stars_amount=pay.total_amount)
+                    logger.info(f"Stars bot @{context.bot.username} processed payment from user {tid}")
+                except Exception as e:
+                    logger.error(f"Stars payment handler error: {e}", exc_info=True)
+            
+            application.add_handler(PreCheckoutQueryHandler(stars_precheckout))
+            application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, stars_payment))
+            
+            stars_bots[bun] = application
+            await application.initialize(); await application.start(); await application.updater.start_polling()
+            logger.info(f"Stars bot @{bun} started")
+        except Exception as e:
+            logger.error(f"Error starting stars bot @{bun}: {e}")
+
+    @staticmethod
+    async def load_and_start_all_bots():
+        try:
+            r = supabase.table('bots').select('*').eq('is_active', True).execute()
+            if not r.data: return
+            tasks = []
+            for b in r.data:
+                if b['bot_username'] not in active_bots:
+                    tasks.append(BotManager.start_bot(b['bot_token'], b['bot_username']))
+                # Also start stars bot if configured
+                sb_token = b.get('stars_bot_token')
+                sb_bun = b.get('stars_bot_username')
+                if sb_token and sb_bun and sb_bun not in stars_bots:
+                    tasks.append(BotManager.start_stars_bot(sb_token, sb_bun, b['bot_username']))
+            # Also start product-level stars bots
+            try:
+                prods = supabase.table('products').select('stars_bot_token, stars_bot_username').eq('is_active', True).execute()
+                for p in (prods.data or []):
+                    ps_token = p.get('stars_bot_token')
+                    ps_bun = p.get('stars_bot_username')
+                    if ps_token and ps_bun and ps_bun not in stars_bots:
+                        tasks.append(BotManager.start_stars_bot(ps_token, ps_bun, 'product_level'))
+            except: pass
+            if tasks: await asyncio.gather(*tasks)
+        except Exception as e:
+            logger.error(f"Error loading bots: {e}")
+
+    @staticmethod
+    async def stop_all_bots():
+        for bun, a in active_bots.items():
+            try: await a.updater.stop(); await a.stop(); await a.shutdown()
+            except: pass
+        active_bots.clear()
+        for bun, a in stars_bots.items():
+            try: await a.updater.stop(); await a.stop(); await a.shutdown()
+            except: pass
+        stars_bots.clear()
+
+
+# ========== SUBSCRIPTION EXPIRATION CHECKER ==========
+
+async def check_expirations():
+    """Background task: check for expiring subscriptions and kick expired users"""
+    while True:
+        try:
+            settings = get_notification_settings()
+            now = datetime.now()
+            
+            # Get all active subscriptions with expires_at set (no joins)
+            r = supabase.table('user_subscriptions').select('*').eq('status', 'active').not_.is_('expires_at', 'null').execute()
+            
+            for sub in (r.data or []):
+                try:
+                    expires_at = datetime.fromisoformat(sub['expires_at'].replace('Z', '+00:00')).replace(tzinfo=None)
+                    diff = (expires_at - now).total_seconds()
+                    
+                    # Fetch related data separately
+                    plan = {}
+                    product = {}
+                    bot_config = {}
+                    if sub.get('plan_id'):
+                        pl_r = supabase.table('subscription_plans').select('*').eq('id', sub['plan_id']).limit(1).execute()
+                        if pl_r.data: plan = pl_r.data[0]
+                    if sub.get('product_id'):
+                        pr_r = supabase.table('products').select('*').eq('id', sub['product_id']).limit(1).execute()
+                        if pr_r.data: product = pr_r.data[0]
+                    if sub.get('bot_id'):
+                        bc_r = supabase.table('bots').select('*').eq('id', sub['bot_id']).limit(1).execute()
+                        if bc_r.data: bot_config = bc_r.data[0]
+                    
+                    plan_duration = plan.get('duration_minutes', 0)
+                    
+                    # Already expired - kick
+                    if diff <= 0:
+                        await kick_user(sub, bot_config, product)
+                        continue
+                    
+                    # Percentage-based notifications to USER (2 warnings + expired = 3 total)
+                    total_secs = plan_duration * 60 if plan_duration > 0 else 0
+                    if total_secs > 0:
+                        pct_remaining = diff / total_secs
+                        tid_sub = sub['telegram_user_id']
+                        bun = bot_config.get('bot_username', '')
+                        pname = product.get('product_name', 'Unknown')
+                        lang = get_user_language(tid_sub, sub.get('bot_id', ''))
+                        
+                        # Format remaining time
+                        if diff >= 86400:
+                            d = int(diff // 86400)
+                            time_left = f"{d} {'día(s)' if lang == 'es' else 'dia(s)' if lang == 'pt' else 'jour(s)' if lang == 'fr' else 'day(s)'}"
+                        elif diff >= 3600:
+                            h = int(diff // 3600)
+                            time_left = f"{h} {'hora(s)' if lang == 'es' else 'hora(s)' if lang == 'pt' else 'heure(s)' if lang == 'fr' else 'hour(s)'}"
+                        elif diff >= 60:
+                            m = int(diff // 60)
+                            time_left = f"{m} {'minuto(s)' if lang == 'es' else 'minuto(s)' if lang == 'pt' else 'minute(s)' if lang == 'fr' else 'minute(s)'}"
+                        else:
+                            s = int(diff)
+                            time_left = f"{s} {'segundo(s)' if lang == 'es' else 'segundo(s)' if lang == 'pt' else 'seconde(s)' if lang == 'fr' else 'second(s)'}"
+                        
+                        async def notify_user(msg_text, flag):
+                            if bun in active_bots:
+                                try:
+                                    await active_bots[bun].bot.send_message(chat_id=tid_sub, text=msg_text)
+                                except: pass
+                            supabase.table('user_subscriptions').update({flag: True}).eq('id', sub['id']).execute()
+                        
+                        # 50% notification
+                        if pct_remaining <= 0.50 and not sub.get('notified_1day'):
+                            msg = t('sub_expiring', lang).replace('${product}', pname).replace('${time}', time_left)
+                            await notify_user(msg, 'notified_1day')
+                        
+                        # 90% notification
+                        if pct_remaining <= 0.10 and not sub.get('notified_15min'):
+                            msg = t('sub_expiring_soon', lang).replace('${product}', pname).replace('${time}', time_left)
+                            await notify_user(msg, 'notified_15min')
+                        
+                except Exception as e:
+                    logger.error(f"Error processing subscription {sub.get('id')}: {e}")
+        except Exception as e:
+            logger.error(f"Error in check_expirations: {e}")
+        
+        await asyncio.sleep(60)
+
+async def kick_user(sub, bot_config, product):
+    """Kick a user from the channel/group when their subscription expires"""
+    try:
+        channel_id = product.get('channel_chat_id')
+        if not channel_id:
+            logger.error(f"No channel_chat_id for subscription {sub['id']}")
+            supabase.table('user_subscriptions').update({'status': 'expired'}).eq('id', sub['id']).execute()
+            return
+        
+        # Try link generator bot first, then main bot
+        kick_bot = await get_or_create_link_gen_bot(bot_config, product)
+        if not kick_bot:
+            bun = bot_config.get('bot_username')
+            if bun in active_bots:
+                kick_bot = active_bots[bun].bot
+        
+        if not kick_bot:
+            logger.error(f"No bot available to kick user {sub['telegram_user_id']}")
+            return
+        
+        tid = sub['telegram_user_id']
+        try:
+            await kick_bot.ban_chat_member(chat_id=channel_id, user_id=tid)
+            # Unban so user can rejoin later if they pay again
+            await asyncio.sleep(1)
+            await kick_bot.unban_chat_member(chat_id=channel_id, user_id=tid)
+        except Exception as e:
+            logger.error(f"Error kicking user {tid}: {e}")
+        
+        # Revoke invite link
+        if sub.get('invite_link'):
+            try:
+                await kick_bot.revoke_chat_invite_link(chat_id=channel_id, invite_link=sub['invite_link'])
+                logger.info(f"Revoked invite link for expired subscription {sub['id']}")
+            except Exception as e:
+                logger.error(f"Error revoking invite link: {e}")
+        
+        supabase.table('user_subscriptions').update({'status': 'expired', 'kicked_at': datetime.now().isoformat()}).eq('id', sub['id']).execute()
+        
+        # Notify user that subscription expired
+        bun = bot_config.get('bot_username', '')
+        if bun in active_bots:
+            try:
+                lang = get_user_language(tid, sub.get('bot_id', ''))
+                msg = t('sub_expired', lang).replace('${product}', product.get('product_name', 'Unknown'))
+                await active_bots[bun].bot.send_message(chat_id=tid, text=msg)
+            except Exception as e:
+                logger.error(f"Error notifying user about expiry: {e}")
+        
+        await send_admin_notification(f"❌ Subscription expired - User kicked\n\nUser: {sub.get('telegram_username', 'Unknown')} ({tid})\nProduct: {product.get('product_name', 'Unknown')}")
+        logger.info(f"Kicked user {tid} from {channel_id}")
+    except Exception as e:
+        logger.error(f"Error in kick_user: {e}")
+
+
+@app.post("/webhook/oxapay")
+async def oxapay_webhook(request: Request):
+    try:
+        payload = await request.json()
+        logger.info(f"OxaPay webhook: {payload}")
+        status = payload.get('status', '')
+        status = status.lower() if isinstance(status, str) else ''
+        oid = payload.get('orderId', '') or payload.get('order_id', '')
+        if status not in ['paid', 'confirmed', 'complete']:
+            return {"status": "ignored"}
+        
+        # Handle balance recharge: rc_{bot_id8}_{uid}_{ts}
+        if oid.startswith('rc_'):
+            parts = oid.split('_')
+            bid_short, tid = parts[1], int(parts[2])
+            # Find bot
+            br = supabase.table('bots').select('*').execute()
+            bot_config = None
+            for b in (br.data or []):
+                if b['id'].startswith(bid_short):
+                    bot_config = b
+                    break
+            if not bot_config: return {"status": "error"}
+            # Get amount from payload
+            amount = float(payload.get('amount', 0))
+            if amount > 0:
+                tk = payload.get('trackId', '') or payload.get('track_id', '')
+                # Avoid duplicates
+                ex = supabase.table('balance_transactions').select('id').eq('reference', f"CRYPTO_RECHARGE_{tk}").execute()
+                if not ex.data:
+                    add_balance_transaction(tid, bot_config['id'], amount, 'recharge', reference=f"CRYPTO_RECHARGE_{tk}", description=f"Crypto recharge")
+                    # Notify user
+                    if bot_config['bot_username'] in active_bots:
+                        try:
+                            lang = get_user_language(tid, bot_config['id'])
+                            new_bal = get_user_balance(tid, bot_config['id'])
+                            await active_bots[bot_config['bot_username']].bot.send_message(chat_id=tid, text=t('balance_recharged', lang, balance=f"{new_bal:.2f}"))
+                        except Exception as e:
+                            logger.error(f"Error notifying recharge: {e}")
+                    await send_admin_notification(f"Balance recharge\n\nUser ID: {tid}\nAmount: ${amount}\nMethod: Crypto")
+            return {"status": "success"}
+        
+        if not oid.startswith('cx_'):
+            return {"status": "ignored"}
+        parts = oid.split('_')
+        # cx_{sp}_{tid}_{ts} OR cx_{sp}_{plan_short}_{tid}_{ts}
+        sp = parts[1]
+        if len(parts) == 5:
+            plan_short = parts[2]
+            tid = int(parts[3])
+        else:
+            plan_short = None
+            tid = int(parts[2])
+        
+        all_prods = supabase.table('products').select('*').execute()
+        pr_data = [p for p in (all_prods.data or []) if p['id'].startswith(sp)]
+        if not pr_data: return {"status": "error"}
+        p = pr_data[0]
+        br = supabase.table('bots').select('*').eq('id', p['bot_id']).execute()
+        if not br.data: return {"status": "error"}
+        bc = br.data[0]
+        plan = find_plan_by_short(plan_short, p['id']) if plan_short else None
+        
+        # Look up username from pending_purchases
+        uname = "Unknown"
+        try:
+            pend = supabase.table('pending_purchases').select('telegram_username').eq('telegram_user_id', tid).eq('product_id', p['id']).order('created_at', desc=True).limit(1).execute()
+            if pend.data and pend.data[0].get('telegram_username'):
+                uname = pend.data[0]['telegram_username']
+        except Exception as e:
+            logger.error(f"Error looking up username: {e}")
+        
+        # Check active coupon for redemption
+        active_coupon = get_active_coupon(tid, bc['id'])
+        
+        ok = await BotManager.deliver_purchase(bc['bot_username'], tid, p, bc, plan, uname)
+        logger.info(f"Crypto delivery result: ok={ok}, product={p['product_name']}, user={tid}")
+        if ok:
+            tk = payload.get('trackId', '') or payload.get('track_id', '')
+            ex = supabase.table('sales').select('id').eq('hotmart_transaction_id', f"CRYPTO_{tk}").execute()
+            logger.info(f"Crypto duplicate check: exists={bool(ex.data)}, tk={tk}")
+            if not ex.data:
+                supabase.table('sales').insert({'bot_id': p['bot_id'], 'product_id': p['id'], 'telegram_user_id': tid, 'telegram_username': uname, 'hotmart_transaction_id': f"CRYPTO_{tk}", 'payment_method': 'Crypto', 'amount': p['price'], 'status': 'completed'}).execute()
+                logger.info(f"Crypto sale inserted, sending notification...")
+                await send_sale_notification(p['product_name'], p['price'], p.get('currency', 'USD'), 'Crypto', tid, uname, plan['plan_name'] if plan else None)
+                logger.info(f"Crypto sale notification sent")
+                # Redeem coupon if applied
+                if active_coupon:
+                    redeem_coupon(tid, bc['id'], active_coupon['id'], sale_reference=f"CRYPTO_{tk}")
+        return {"status": "success"}
+    except Exception as e:
+        logger.error(f"OxaPay error: {e}", exc_info=True)
+        raise HTTPException(500, detail=str(e))
+
+@app.post("/webhook/hotmart")
+async def hotmart_webhook(request: Request):
+    try:
+        payload = await request.json()
+        try: supabase.table('webhook_logs').insert({'payload': payload, 'processed': False}).execute()
+        except: pass
+        event = payload.get('event')
+        if event in ['PURCHASE_COMPLETE', 'PURCHASE_APPROVED']:
+            purchase = payload.get('data', {}).get('purchase', {})
+            tx = purchase.get('transaction', '')
+            sck = purchase.get('sck', '') or purchase.get('origin', {}).get('sck', '')
+            if not sck: return {"status": "error"}
+            try:
+                sp = sck[3:].split('_')
+                tid, pid = int(sp[0]), '_'.join(sp[1:-1])
+            except: return {"status": "error"}
+            pend = supabase.table('pending_purchases').select('*, products(*), bots(*)').eq('telegram_user_id', tid).eq('product_id', pid).eq('status', 'pending').order('created_at', desc=True).limit(1).execute()
+            if pend.data:
+                pe = pend.data[0]
+                p, bc = pe['products'], pe['bots']
+                ok = await BotManager.deliver_purchase(bc['bot_username'], pe['telegram_user_id'], p, bc, None, pe['telegram_username'])
+                if ok:
+                    supabase.table('pending_purchases').update({'status': 'completed'}).eq('id', pe['id']).execute()
+                    ex = supabase.table('sales').select('id').eq('hotmart_transaction_id', tx).execute()
+                    if not ex.data:
+                        supabase.table('sales').insert({'bot_id': p['bot_id'], 'product_id': p['id'], 'telegram_user_id': pe['telegram_user_id'], 'telegram_username': pe['telegram_username'], 'hotmart_transaction_id': tx, 'amount': p['price'], 'payment_method': 'Hotmart', 'status': 'completed'}).execute()
+                        await send_sale_notification(p['product_name'], p['price'], p.get('currency', 'USD'), 'Hotmart', pe['telegram_user_id'], pe['telegram_username'])
+            return {"status": "success"}
+        return {"status": "ignored"}
+    except Exception as e:
+        logger.error(f"Hotmart error: {e}", exc_info=True)
+        raise HTTPException(500, detail=str(e))
+
+@app.get("/health")
+async def health_check():
+    return {"status": "running", "active_bots": len(active_bots)}
+
+@app.post("/approve-manual-payment/{payment_id}")
+async def approve_manual_payment(payment_id: str):
+    try:
+        pay = supabase.table('manual_payments').select('*').eq('id', payment_id).execute()
+        if not pay.data: raise HTTPException(404)
+        pa = pay.data[0]
+        if pa['status'] != 'pending': return {"status": "error"}
+        pr = supabase.table('products').select('*').eq('id', pa['product_id']).execute()
+        if not pr.data: raise HTTPException(404)
+        p = pr.data[0]
+        br = supabase.table('bots').select('*').eq('id', p['bot_id']).execute()
+        if not br.data: raise HTTPException(404)
+        bc = br.data[0]
+        plan = None
+        if pa.get('plan_id'):
+            plr = supabase.table('subscription_plans').select('*').eq('id', pa['plan_id']).execute()
+            if plr.data: plan = plr.data[0]
+        ok = await BotManager.deliver_purchase(bc['bot_username'], pa['telegram_user_id'], p, bc, plan, pa['telegram_username'])
+        if ok:
+            supabase.table('manual_payments').update({'status': 'approved', 'reviewed_at': datetime.now().isoformat()}).eq('id', payment_id).execute()
+            ex = supabase.table('sales').select('id').eq('hotmart_transaction_id', pa['transaction_id']).execute()
+            if not ex.data:
+                supabase.table('sales').insert({'bot_id': p['bot_id'], 'product_id': p['id'], 'telegram_user_id': pa['telegram_user_id'], 'telegram_username': pa['telegram_username'], 'hotmart_transaction_id': pa['transaction_id'], 'amount': p['price'], 'payment_method': 'Manual', 'status': 'completed'}).execute()
+                await send_sale_notification(p['product_name'], p['price'], p.get('currency', 'USD'), 'Manual', pa['telegram_user_id'], pa['telegram_username'], plan['plan_name'] if plan else None)
+            return {"status": "success"}
+        return {"status": "error"}
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+
+@app.post("/kick-subscription/{subscription_id}")
+async def kick_subscription(subscription_id: str):
+    """Manual kick from admin panel"""
+    try:
+        sr = supabase.table('user_subscriptions').select('*').eq('id', subscription_id).execute()
+        if not sr.data: raise HTTPException(404)
+        sub = sr.data[0]
+        product = {}
+        bot_config = {}
+        if sub.get('product_id'):
+            pr_r = supabase.table('products').select('*').eq('id', sub['product_id']).limit(1).execute()
+            if pr_r.data: product = pr_r.data[0]
+        if sub.get('bot_id'):
+            bc_r = supabase.table('bots').select('*').eq('id', sub['bot_id']).limit(1).execute()
+            if bc_r.data: bot_config = bc_r.data[0]
+        await kick_user(sub, bot_config, product)
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+
+@app.post("/extend-subscription/{subscription_id}")
+async def extend_subscription(subscription_id: str, request: Request):
+    """Manual extension from admin panel"""
+    try:
+        body = await request.json()
+        days = int(body.get('days', 30))
+        sr = supabase.table('user_subscriptions').select('*').eq('id', subscription_id).execute()
+        if not sr.data: raise HTTPException(404)
+        sub = sr.data[0]
+        current_expires = datetime.fromisoformat(sub['expires_at'].replace('Z', '+00:00')).replace(tzinfo=None) if sub.get('expires_at') else datetime.now()
+        new_expires = max(current_expires, datetime.now()) + timedelta(days=days)
+        supabase.table('user_subscriptions').update({
+            'expires_at': new_expires.isoformat(),
+            'status': 'active',
+            'notified_1day': False, 'notified_1hour': False, 'notified_15min': False
+        }).eq('id', subscription_id).execute()
+        return {"status": "success", "new_expires": new_expires.isoformat()}
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+
+
+async def _do_remove_access(tid: int, bot_id: str, product_id: Optional[str] = None, kick: bool = False):
+    """Internal function to remove access for a user. Used by both /remove-access and /ban-user endpoints."""
+    sales_q = supabase.table('sales').select('*').eq('telegram_user_id', tid).eq('bot_id', bot_id)
+    if product_id: sales_q = sales_q.eq('product_id', product_id)
+    sales_r = sales_q.execute()
+    sales_count = len(sales_r.data or [])
+    
+    subs_q = supabase.table('user_subscriptions').select('*').eq('telegram_user_id', tid).eq('bot_id', bot_id)
+    if product_id: subs_q = subs_q.eq('product_id', product_id)
+    subs_r = subs_q.execute()
+    subs_count = len(subs_r.data or [])
+    
+    affected_product_ids = set()
+    for s in (sales_r.data or []): affected_product_ids.add(s.get('product_id'))
+    for s in (subs_r.data or []): affected_product_ids.add(s.get('product_id'))
+    
+    codes_count = 0
+    for pid in affected_product_ids:
+        if not pid: continue
+        ic_r = supabase.table('invite_codes').select('id').eq('used_by_telegram_user_id', tid).eq('product_id', pid).execute()
+        codes_count += len(ic_r.data or [])
+        for c in (ic_r.data or []):
+            supabase.table('invite_codes').update({'is_used': False, 'used_by_telegram_user_id': None, 'used_at': None}).eq('id', c['id']).execute()
+    
+    kicked_channels = []
+    if kick:
+        bc_r = supabase.table('bots').select('*').eq('id', bot_id).execute()
+        bot_config = bc_r.data[0] if bc_r.data else {}
+        for pid in affected_product_ids:
+            if not pid: continue
+            pr = supabase.table('products').select('channel_chat_id, link_generator_bot_token').eq('id', pid).limit(1).execute()
+            if pr.data and pr.data[0].get('channel_chat_id'):
+                channel_id = pr.data[0]['channel_chat_id']
+                kick_bot = await get_or_create_link_gen_bot(bot_config, pr.data[0])
+                if not kick_bot:
+                    bun = bot_config.get('bot_username')
+                    if bun in active_bots: kick_bot = active_bots[bun].bot
+                if kick_bot:
+                    try:
+                        await kick_bot.ban_chat_member(chat_id=channel_id, user_id=tid)
+                        await asyncio.sleep(1)
+                        await kick_bot.unban_chat_member(chat_id=channel_id, user_id=tid)
+                        kicked_channels.append(channel_id)
+                    except Exception as e:
+                        logger.error(f"Error kicking from {channel_id}: {e}")
+                    # Revoke invite links for this user
+                    try:
+                        subs_links = supabase.table('user_subscriptions').select('invite_link').eq('telegram_user_id', tid).eq('product_id', pid).execute()
+                        for sl in (subs_links.data or []):
+                            if sl.get('invite_link'):
+                                try:
+                                    await kick_bot.revoke_chat_invite_link(chat_id=channel_id, invite_link=sl['invite_link'])
+                                    logger.info(f"Revoked invite link for user {tid}")
+                                except Exception as e:
+                                    logger.error(f"Error revoking invite link: {e}")
+                    except Exception as e:
+                        logger.error(f"Error looking up invite links to revoke: {e}")
+    
+    del_sales = supabase.table('sales').delete().eq('telegram_user_id', tid).eq('bot_id', bot_id)
+    if product_id: del_sales = del_sales.eq('product_id', product_id)
+    del_sales.execute()
+    
+    del_subs = supabase.table('user_subscriptions').delete().eq('telegram_user_id', tid).eq('bot_id', bot_id)
+    if product_id: del_subs = del_subs.eq('product_id', product_id)
+    del_subs.execute()
+    
+    del_pend = supabase.table('pending_purchases').delete().eq('telegram_user_id', tid).eq('bot_id', bot_id)
+    if product_id: del_pend = del_pend.eq('product_id', product_id)
+    del_pend.execute()
+    
+    return sales_count, subs_count, codes_count, len(kicked_channels)
+
+
+@app.post("/remove-access")
+async def remove_access(request: Request):
+    try:
+        body = await request.json()
+        tid = int(body.get('telegram_user_id'))
+        bot_id = body.get('bot_id')
+        product_id = body.get('product_id')
+        kick = bool(body.get('kick', False))
+        if not tid or not bot_id:
+            raise HTTPException(400, detail="telegram_user_id and bot_id required")
+        sales_count, subs_count, codes_count, kicked = await _do_remove_access(tid, bot_id, product_id, kick)
+        logger.info(f"Removed access for user {tid} from bot {bot_id}, product {product_id}: {sales_count} sales, {subs_count} subs, {codes_count} codes, kicked from {kicked} channels")
+        return {"status": "success", "removed_sales": sales_count, "removed_subscriptions": subs_count, "released_invite_codes": codes_count, "kicked_channels": kicked}
+    except HTTPException: raise
+    except Exception as e:
+        logger.error(f"Error removing access: {e}", exc_info=True)
+        raise HTTPException(500, detail=str(e))
+
+
+@app.post("/ban-user")
+async def ban_user(request: Request):
+    """Ban a user from a bot. Optionally also remove their access and kick from channels."""
+    try:
+        body = await request.json()
+        tid = int(body.get('telegram_user_id'))
+        bot_id = body.get('bot_id')
+        reason = body.get('reason', '')
+        remove_access_flag = bool(body.get('remove_access', True))
+        
+        if not tid or not bot_id:
+            raise HTTPException(400, detail="telegram_user_id and bot_id required")
+        
+        # Insert ban (upsert in case already banned)
+        try:
+            supabase.table('banned_users').insert({
+                'telegram_user_id': tid,
+                'bot_id': bot_id,
+                'reason': reason or None,
+                'banned_at': datetime.now().isoformat()
+            }).execute()
+        except Exception as e:
+            # Maybe already banned - try update
+            logger.info(f"Ban insert failed (maybe duplicate), trying update: {e}")
+            supabase.table('banned_users').update({
+                'reason': reason or None,
+                'banned_at': datetime.now().isoformat()
+            }).eq('telegram_user_id', tid).eq('bot_id', bot_id).execute()
+        
+        result = {"status": "success", "banned": True}
+        
+        if remove_access_flag:
+            sc, subc, cc, kc = await _do_remove_access(tid, bot_id, product_id=None, kick=True)
+            result.update({"removed_sales": sc, "removed_subscriptions": subc, "released_invite_codes": cc, "kicked_channels": kc})
+        
+        logger.info(f"Banned user {tid} from bot {bot_id}. Reason: {reason}")
+        return result
+    except HTTPException: raise
+    except Exception as e:
+        logger.error(f"Error banning user: {e}", exc_info=True)
+        raise HTTPException(500, detail=str(e))
+
+
+@app.post("/unban-user")
+async def unban_user(request: Request):
+    """Remove a ban from a user"""
+    try:
+        body = await request.json()
+        tid = int(body.get('telegram_user_id'))
+        bot_id = body.get('bot_id')
+        if not tid or not bot_id:
+            raise HTTPException(400, detail="telegram_user_id and bot_id required")
+        supabase.table('banned_users').delete().eq('telegram_user_id', tid).eq('bot_id', bot_id).execute()
+        logger.info(f"Unbanned user {tid} from bot {bot_id}")
+        return {"status": "success"}
+    except HTTPException: raise
+    except Exception as e:
+        logger.error(f"Error unbanning user: {e}", exc_info=True)
+        raise HTTPException(500, detail=str(e))
+
+
+@app.post("/admin-add-balance")
+async def admin_add_balance(request: Request):
+    """Admin manually adds (or subtracts if negative) balance to a user"""
+    try:
+        body = await request.json()
+        tid = int(body.get('telegram_user_id'))
+        bot_id = body.get('bot_id')
+        amount = float(body.get('amount', 0))
+        note = body.get('note', '')
+        if not tid or not bot_id or amount == 0:
+            raise HTTPException(400, detail="telegram_user_id, bot_id and non-zero amount required")
+        type_ = 'admin_add' if amount > 0 else 'admin_remove'
+        new_bal = add_balance_transaction(tid, bot_id, amount, type_, description=f"Admin {'added' if amount > 0 else 'removed'} ${abs(amount)}", admin_note=note)
+        if new_bal is None:
+            raise HTTPException(500, detail="Failed to update balance")
+        # Notify user if bot is running
+        try:
+            br = supabase.table('bots').select('bot_username').eq('id', bot_id).limit(1).execute()
+            logger.info(f"Admin balance notify: bot lookup: {br.data}")
+            if br.data:
+                bun = br.data[0]['bot_username']
+                if bun in active_bots:
+                    lang = get_user_language(tid, bot_id)
+                    sign = "+" if amount > 0 else "-"
+                    msg = f"{sign}${abs(amount):.2f} → {t('balance_current', lang)} ${new_bal:.2f}"
+                    if note:
+                        msg += f"\n📝 {note}"
+                    await active_bots[bun].bot.send_message(chat_id=tid, text=msg)
+                    logger.info(f"Admin balance notification sent to {tid}")
+                else:
+                    logger.error(f"Admin balance notify: bot {bun} not in active_bots")
+        except Exception as e:
+            logger.error(f"Error notifying user about balance: {e}", exc_info=True)
+        logger.info(f"Admin balance change for user {tid}: {amount} ({note})")
+        return {"status": "success", "new_balance": new_bal}
+    except HTTPException: raise
+    except Exception as e:
+        logger.error(f"Error in admin-add-balance: {e}", exc_info=True)
+        raise HTTPException(500, detail=str(e))
+
+
+@app.post("/refund-sale")
+async def refund_sale(request: Request):
+    """Refund a sale: return amount to user balance, mark sale as refunded, optionally remove access"""
+    try:
+        body = await request.json()
+        sale_id = body.get('sale_id')
+        remove_access = bool(body.get('remove_access', True))
+        
+        if not sale_id:
+            raise HTTPException(400, detail="sale_id required")
+        
+        # Get the sale
+        sr = supabase.table('sales').select('*').eq('id', sale_id).limit(1).execute()
+        if not sr.data:
+            raise HTTPException(404, detail="Sale not found")
+        sale = sr.data[0]
+        
+        if sale.get('status') == 'refunded':
+            raise HTTPException(400, detail="Sale already refunded")
+        
+        tid = sale['telegram_user_id']
+        bot_id = sale['bot_id']
+        product_id = sale.get('product_id')
+        amount = float(sale.get('amount', 0))
+        
+        # 1. Refund to balance
+        if amount > 0:
+            new_bal = add_balance_transaction(tid, bot_id, amount, 'refund', reference=f"REFUND_{sale_id[:8]}", description=f"Refund: {sale_id[:8]}")
+        else:
+            new_bal = get_user_balance(tid, bot_id)
+        
+        # 2. Mark sale as refunded
+        supabase.table('sales').update({'status': 'refunded'}).eq('id', sale_id).execute()
+        
+        # 3. Remove access if requested
+        kicked = 0
+        if remove_access and product_id:
+            _, _, _, kicked = await _do_remove_access(tid, bot_id, product_id, kick=True)
+        
+        # 4. Notify user
+        try:
+            br = supabase.table('bots').select('bot_username').eq('id', bot_id).limit(1).execute()
+            logger.info(f"Refund notify: bot lookup: {br.data}, bot_id: {bot_id}")
+            if br.data:
+                bun = br.data[0]['bot_username']
+                logger.info(f"Refund notify: bot {bun}, in active_bots: {bun in active_bots}")
+                if bun in active_bots:
+                    lang = get_user_language(tid, bot_id)
+                    refund_msg = t('refund_notification', lang).replace('${amount}', f'{amount:.2f}').replace('${balance}', f'{(new_bal or 0):.2f}')
+                    logger.info(f"Refund notify: sending to {tid}: {refund_msg}")
+                    await active_bots[bun].bot.send_message(chat_id=tid, text=f"💸 {refund_msg}")
+                    logger.info(f"Refund notification sent to {tid}")
+                else:
+                    logger.error(f"Refund notify: bot {bun} not in active_bots. Active: {list(active_bots.keys())}")
+            else:
+                logger.error(f"Refund notify: no bot found for id {bot_id}")
+        except Exception as e:
+            logger.error(f"Error notifying refund: {e}", exc_info=True)
+        
+        # 5. Admin notification
+        await send_admin_notification(f"Refund processed\n\nSale: {sale_id[:8]}\nUser: {tid}\nAmount: ${amount}\nKicked: {'Yes' if kicked else 'No'}")
+        
+        logger.info(f"Refund: sale {sale_id}, user {tid}, amount ${amount}, kicked={kicked}")
+        return {"status": "success", "refunded_amount": amount, "new_balance": new_bal, "kicked_channels": kicked}
+    except HTTPException: raise
+    except Exception as e:
+        logger.error(f"Error in refund-sale: {e}", exc_info=True)
+        raise HTTPException(500, detail=str(e))
+
+
+@app.post("/approve-transfer")
+async def approve_transfer(request: Request):
+    """Approve a pending balance transfer"""
+    try:
+        body = await request.json()
+        transfer_id = body.get('transfer_id')
+        if not transfer_id:
+            raise HTTPException(400, detail="transfer_id required")
+        
+        tr = supabase.table('balance_transfers').select('*').eq('id', transfer_id).limit(1).execute()
+        if not tr.data:
+            raise HTTPException(404, detail="Transfer not found")
+        transfer = tr.data[0]
+        
+        if transfer['status'] != 'pending':
+            raise HTTPException(400, detail="Transfer already processed")
+        
+        from_id = transfer['from_user_id']
+        to_id = transfer['to_user_id']
+        bot_id = transfer['bot_id']
+        amount = float(transfer['amount'])
+        
+        # Check sender still has balance
+        from_bal = get_user_balance(from_id, bot_id)
+        if from_bal < amount:
+            raise HTTPException(400, detail=f"Sender has insufficient balance (${from_bal:.2f})")
+        
+        # Deduct from sender
+        new_from_bal = add_balance_transaction(from_id, bot_id, -amount, 'transfer_out', reference=f"TRANSFER_{transfer_id[:8]}", description=f"Transfer to {to_id}")
+        
+        # Add to recipient
+        new_to_bal = add_balance_transaction(to_id, bot_id, amount, 'transfer_in', reference=f"TRANSFER_{transfer_id[:8]}", description=f"Transfer from {from_id}")
+        
+        # Mark as approved
+        supabase.table('balance_transfers').update({
+            'status': 'approved',
+            'resolved_at': datetime.now().isoformat()
+        }).eq('id', transfer_id).execute()
+        
+        # Notify sender
+        try:
+            br = supabase.table('bots').select('bot_username').eq('id', bot_id).limit(1).execute()
+            logger.info(f"Transfer notify: bot lookup result: {br.data}")
+            if br.data:
+                bun = br.data[0]['bot_username']
+                logger.info(f"Transfer notify: looking for bot {bun} in active_bots: {bun in active_bots}")
+                if bun in active_bots:
+                    lang_from = get_user_language(from_id, bot_id)
+                    msg = t('transfer_approved', lang_from).replace('${amount}', f'{amount:.2f}').replace('${balance}', f'{(new_from_bal or 0):.2f}')
+                    try:
+                        await active_bots[bun].bot.send_message(chat_id=from_id, text=msg)
+                        logger.info(f"Transfer approved notification sent to sender {from_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to notify sender {from_id}: {e}")
+                    # Notify recipient
+                    lang_to = get_user_language(to_id, bot_id)
+                    msg2 = t('transfer_received', lang_to).replace('${amount}', f'{amount:.2f}').replace('${balance}', f'{(new_to_bal or 0):.2f}')
+                    try:
+                        await active_bots[bun].bot.send_message(chat_id=to_id, text=msg2)
+                        logger.info(f"Transfer received notification sent to recipient {to_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to notify recipient {to_id}: {e}")
+        except Exception as e:
+            logger.error(f"Error notifying transfer: {e}", exc_info=True)
+        
+        # Admin notification
+        await send_admin_notification(f"Transfer approved\n\nFrom: {from_id}\nTo: {to_id}\nAmount: ${amount:.2f}")
+        
+        logger.info(f"Transfer approved: {transfer_id}, from {from_id} to {to_id}, ${amount}")
+        return {"status": "success", "from_balance": new_from_bal, "to_balance": new_to_bal}
+    except HTTPException: raise
+    except Exception as e:
+        logger.error(f"Error approving transfer: {e}", exc_info=True)
+        raise HTTPException(500, detail=str(e))
+
+
+@app.post("/reject-transfer")
+async def reject_transfer(request: Request):
+    """Reject a pending balance transfer"""
+    try:
+        body = await request.json()
+        transfer_id = body.get('transfer_id')
+        reason = body.get('reason', '')
+        if not transfer_id:
+            raise HTTPException(400, detail="transfer_id required")
+        
+        tr = supabase.table('balance_transfers').select('*').eq('id', transfer_id).limit(1).execute()
+        if not tr.data:
+            raise HTTPException(404, detail="Transfer not found")
+        transfer = tr.data[0]
+        
+        if transfer['status'] != 'pending':
+            raise HTTPException(400, detail="Transfer already processed")
+        
+        # Mark as rejected
+        supabase.table('balance_transfers').update({
+            'status': 'rejected',
+            'resolved_at': datetime.now().isoformat(),
+            'admin_note': reason or None
+        }).eq('id', transfer_id).execute()
+        
+        # Notify sender
+        try:
+            br = supabase.table('bots').select('bot_username').eq('id', transfer['bot_id']).limit(1).execute()
+            if br.data:
+                bun = br.data[0]['bot_username']
+                if bun in active_bots:
+                    lang = get_user_language(transfer['from_user_id'], transfer['bot_id'])
+                    msg = t('transfer_rejected', lang).replace('${amount}', f"{float(transfer['amount']):.2f}")
+                    try:
+                        await active_bots[bun].bot.send_message(chat_id=transfer['from_user_id'], text=msg)
+                        logger.info(f"Transfer rejection notification sent to {transfer['from_user_id']}")
+                    except Exception as e:
+                        logger.error(f"Failed to notify rejection to {transfer['from_user_id']}: {e}")
+        except Exception as e:
+            logger.error(f"Error notifying rejection: {e}", exc_info=True)
+        
+        await send_admin_notification(f"Transfer rejected\n\nFrom: {transfer['from_user_id']}\nTo: {transfer['to_user_id']}\nAmount: ${float(transfer['amount']):.2f}\nReason: {reason or 'N/A'}")
+        
+        logger.info(f"Transfer rejected: {transfer_id}, reason: {reason}")
+        return {"status": "success"}
+    except HTTPException: raise
+    except Exception as e:
+        logger.error(f"Error rejecting transfer: {e}", exc_info=True)
+        raise HTTPException(500, detail=str(e))
+
+@app.post("/send-gift")
+async def send_gift(request: Request):
+    try:
+        body = await request.json()
+        logger.info(f"send-gift received: {body}")
+        bot_id = body.get('bot_id')
+        product_id = body.get('product_id')
+        tid = body.get('telegram_user_id')
+        uname = body.get('telegram_username', 'Unknown')
+        
+        if not all([bot_id, product_id, tid]):
+            logger.error(f"send-gift missing fields: bot_id={bot_id}, product_id={product_id}, tid={tid}")
+            raise HTTPException(400, detail=f"Missing required fields: bot_id={bool(bot_id)}, product_id={bool(product_id)}, tid={bool(tid)}")
+        
+        tid = int(tid)
+        
+        br = supabase.table('bots').select('*').eq('id', bot_id).execute()
+        if not br.data:
+            raise HTTPException(404, detail="Bot not found")
+        bc = br.data[0]
+        
+        pr = supabase.table('products').select('*').eq('id', product_id).execute()
+        if not pr.data:
+            raise HTTPException(404, detail="Product not found")
+        product = pr.data[0]
+        
+        invite_link = None
+        
+        if product.get('channel_chat_id'):
+            invite_link = await generate_invite_link(bc, product, tid, uname)
+            if not invite_link:
+                raise HTTPException(500, detail="Could not generate invite link")
+        else:
+            icr = supabase.table('invite_codes').select('*').eq('product_id', product_id).eq('is_used', False).limit(1).execute()
+            if icr.data:
+                ic = icr.data[0]
+                invite_link = ic['code']
+                supabase.table('invite_codes').update({'is_used': True, 'used_by_telegram_user_id': tid, 'used_at': datetime.now().isoformat()}).eq('id', ic['id']).execute()
+            else:
+                raise HTTPException(400, detail="No invite codes available")
+        
+        supabase.table('sales').insert({
+            'bot_id': bot_id, 'product_id': product_id, 'telegram_user_id': tid,
+            'telegram_username': uname, 'hotmart_transaction_id': f"GIFT_{int(datetime.now().timestamp())}",
+            'payment_method': 'Gift', 'amount': 0, 'status': 'completed'
+        }).execute()
+        
+        bun = bc.get('bot_username')
+        if bun in active_bots:
+            try:
+                lang = get_user_language(tid, bot_id)
+                await active_bots[bun].bot.send_message(chat_id=tid, text=f"🎁 {t('purchase_message', lang).replace('{invite_link}', invite_link)}")
+            except Exception as e:
+                logger.error(f"Error sending gift to user: {e}")
+        
+        await send_admin_notification(f"🎁 Gift sent\n\nProduct: {product['product_name']}\nTo: @{uname} ({tid})")
+        return {"status": "success", "invite_link": invite_link}
+    except HTTPException: raise
+    except Exception as e:
+        logger.error(f"Error sending gift: {e}", exc_info=True)
+        raise HTTPException(500, detail=str(e))
+
+@app.post("/replace-link")
+async def replace_link(request: Request):
+    try:
+        body = await request.json()
+        logger.info(f"replace-link received: {body}")
+        bot_id = body.get('bot_id')
+        product_id = body.get('product_id')
+        tid = int(body.get('telegram_user_id'))
+        uname = body.get('telegram_username', 'Unknown')
+        
+        if not all([bot_id, product_id, tid]):
+            logger.error(f"replace-link missing fields: bot_id={bot_id}, product_id={product_id}, tid={tid}")
+            raise HTTPException(400, detail="Missing required fields")
+        
+        br = supabase.table('bots').select('*').eq('id', bot_id).execute()
+        if not br.data:
+            raise HTTPException(404, detail="Bot not found")
+        bc = br.data[0]
+        
+        pr = supabase.table('products').select('*').eq('id', product_id).execute()
+        if not pr.data:
+            raise HTTPException(404, detail="Product not found")
+        product = pr.data[0]
+        
+        # Revoke old invite links for this user
+        if product.get('channel_chat_id'):
+            kick_bot = await get_or_create_link_gen_bot(bc, product)
+            if kick_bot:
+                try:
+                    subs = supabase.table('user_subscriptions').select('invite_link').eq('telegram_user_id', tid).eq('product_id', product_id).execute()
+                    for sl in (subs.data or []):
+                        if sl.get('invite_link'):
+                            try:
+                                await kick_bot.revoke_chat_invite_link(chat_id=product['channel_chat_id'], invite_link=sl['invite_link'])
+                            except: pass
+                except: pass
+        
+        # Generate new link
+        invite_link = None
+        if product.get('channel_chat_id'):
+            invite_link = await generate_invite_link(bc, product, tid, uname)
+            if not invite_link:
+                raise HTTPException(500, detail="Could not generate invite link")
+        else:
+            icr = supabase.table('invite_codes').select('*').eq('product_id', product_id).eq('is_used', False).limit(1).execute()
+            if icr.data:
+                ic = icr.data[0]
+                invite_link = ic['code']
+                supabase.table('invite_codes').update({'is_used': True, 'used_by_telegram_user_id': tid, 'used_at': datetime.now().isoformat()}).eq('id', ic['id']).execute()
+            else:
+                raise HTTPException(400, detail="No invite codes available")
+        
+        # Send new link to user
+        bun = bc.get('bot_username')
+        if bun in active_bots:
+            try:
+                lang = get_user_language(tid, bot_id)
+                await active_bots[bun].bot.send_message(chat_id=tid, text=f"🔄 {t('purchase_message', lang).replace('{invite_link}', invite_link)}")
+            except Exception as e:
+                logger.error(f"Error sending replacement link: {e}")
+        
+        await send_admin_notification(f"🔄 Link replaced\n\nProduct: {product['product_name']}\nTo: @{uname} ({tid})")
+        return {"status": "success", "invite_link": invite_link}
+    except HTTPException: raise
+    except Exception as e:
+        logger.error(f"Error replacing link: {e}", exc_info=True)
+        raise HTTPException(500, detail=str(e))
+
+@app.post("/broadcast")
+async def broadcast(request: Request):
+    try:
+        body = await request.json()
+        bot_id = body.get('bot_id')
+        message = body.get('message', '').strip()
+        target = body.get('target', 'all')  # 'all' or 'buyers'
+        
+        if not bot_id or not message:
+            raise HTTPException(400, detail="Missing bot_id or message")
+        
+        br = supabase.table('bots').select('bot_username').eq('id', bot_id).limit(1).execute()
+        if not br.data:
+            raise HTTPException(404, detail="Bot not found")
+        bun = br.data[0]['bot_username']
+        if bun not in active_bots:
+            raise HTTPException(400, detail="Bot not running")
+        
+        # Get user IDs
+        user_ids = set()
+        if target == 'buyers':
+            sales = supabase.table('sales').select('telegram_user_id').eq('bot_id', bot_id).eq('status', 'completed').execute()
+            for s in (sales.data or []):
+                user_ids.add(s['telegram_user_id'])
+        else:
+            langs = supabase.table('user_languages').select('telegram_user_id').eq('bot_id', bot_id).execute()
+            for l in (langs.data or []):
+                user_ids.add(l['telegram_user_id'])
+        
+        if not user_ids:
+            return {"status": "success", "sent": 0, "failed": 0, "total": 0}
+        
+        # Send in background
+        async def do_broadcast():
+            sent = 0
+            failed = 0
+            bot = active_bots[bun].bot
+            for uid in user_ids:
+                try:
+                    await bot.send_message(chat_id=uid, text=message)
+                    sent += 1
+                except:
+                    failed += 1
+                await asyncio.sleep(0.05)
+            logger.info(f"Broadcast to {bun}: sent={sent}, failed={failed}, total={len(user_ids)}")
+            await send_admin_notification(f"📢 Broadcast complete\n\nBot: @{bun}\nSent: {sent}\nFailed: {failed}\nTotal: {len(user_ids)}")
+        
+        asyncio.create_task(do_broadcast())
+        return {"status": "success", "total": len(user_ids), "message": "Broadcasting started"}
+    except HTTPException: raise
+    except Exception as e:
+        logger.error(f"Broadcast error: {e}", exc_info=True)
+        raise HTTPException(500, detail=str(e))
+
+async def periodic_bot_reload():
+    while True:
+        try: await BotManager.load_and_start_all_bots()
+        except: pass
+        await asyncio.sleep(60)
+
+def run_fastapi():
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+
+async def main():
+    logger.info("Starting Bot Manager...")
+    Thread(target=run_fastapi, daemon=True).start()
+    await BotManager.load_and_start_all_bots()
+    # Start subscription expiration checker
+    asyncio.create_task(check_expirations())
+    await periodic_bot_reload()
+
+if __name__ == "__main__":
+    try: asyncio.run(main())
+    except KeyboardInterrupt: asyncio.run(BotManager.stop_all_bots())
