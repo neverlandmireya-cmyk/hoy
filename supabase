@@ -1,0 +1,40 @@
+Perfecto. Empiezo la migración:
+
+No puedo acceder a Supabase desde aquí. Te creo el script y lo corres en tu VPS:
+
+Ahora sigue estos pasos en tu nuevo VPS:
+
+1. Sube el archivo migrate.py a /opt/bot-manager/migrate.py
+
+2. Corre la migración:
+
+cd /opt/bot-manager
+/opt/bot-manager/venv/bin/python3 migrate.py
+
+
+3. Cuando diga “Press ENTER after you’ve run the SQL”:
+
+	•	Abre https://supabase.com/dashboard/project/kosmdtcrrklaalfyxmlc/sql/new
+	•	Abre el archivo /tmp/create_tables.sql en el VPS: cat /tmp/create_tables.sql
+	•	Copia TODO ese SQL y pégalo en el dashboard → Click Run
+	•	Vuelve al terminal y presiona Enter
+
+4. El script importa toda la data automáticamente
+
+5. Después actualiza el bot:
+
+nano /opt/bot-manager/bot_manager.py
+
+
+Cambia estas dos líneas:
+
+SUPABASE_URL = "https://kosmdtcrrklaalfyxmlc.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imtvc21kdGNycmtsYWFsZnl4bWxjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk2NDQ3NjMsImV4cCI6MjA5NTIyMDc2M30.ysSsMVA3nmhqKbl-Vwu63WN1qKjw0InE2mRC5uBkjT8"
+
+
+6. Reinicia:
+
+supervisorctl restart bot-manager
+
+
+El bot no pierde servicio excepto los segundos del reinicio. Toda la data migra completa.
