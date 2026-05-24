@@ -1,14 +1,128 @@
-CREATE TABLE IF NOT EXISTS app_settings (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), key text, value text, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now());
-CREATE TABLE IF NOT EXISTS banned_users (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), telegram_user_id bigint, bot_id uuid, banned_at timestamptz DEFAULT now(), reason text);
-CREATE TABLE IF NOT EXISTS bot_translations (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), bot_id uuid, language_code text, key text, value text, created_at timestamptz DEFAULT now());
-CREATE TABLE IF NOT EXISTS coupon_activations (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), coupon_id uuid, telegram_user_id bigint, bot_id uuid, sale_reference text, activated_at timestamptz DEFAULT now(), redeemed_at timestamptz DEFAULT now(), created_at timestamptz DEFAULT now());
-CREATE TABLE IF NOT EXISTS generator_bots (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), bot_token text, bot_username text, bot_name text, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now());
-CREATE TABLE IF NOT EXISTS gifts (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), bot_id uuid, product_id uuid, telegram_user_id bigint, telegram_username text, invite_link text, invite_code text, created_at timestamptz DEFAULT now());
-CREATE TABLE IF NOT EXISTS link_generation_logs (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), bot_id uuid, channel_id text, invite_link text, member_limit integer, created_at timestamptz DEFAULT now());
-CREATE TABLE IF NOT EXISTS manual_payment_methods (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), name text, payment_details text, payment_url text, require_email boolean DEFAULT false, require_transaction_id boolean DEFAULT false, require_code boolean DEFAULT false, require_random_note boolean DEFAULT false, exclude_from_coupons boolean DEFAULT false, is_active boolean DEFAULT true, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now());
-CREATE TABLE IF NOT EXISTS payment_method_assignments (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), payment_method_id uuid, product_id uuid, bot_id uuid, is_enabled boolean DEFAULT true, created_at timestamptz DEFAULT now());
-CREATE TABLE IF NOT EXISTS pending_purchases (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), bot_id uuid, product_id uuid, plan_id uuid, telegram_user_id bigint, telegram_username text, payment_method text, amount numeric, status text DEFAULT 'pending', transaction_id text, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now());
-CREATE TABLE IF NOT EXISTS subscriptions (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), telegram_user_id bigint, product_id uuid, bot_id uuid, plan_id uuid, status text DEFAULT 'active', created_at timestamptz DEFAULT now(), expires_at timestamptz);
-CREATE TABLE IF NOT EXISTS user_active_coupons (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), telegram_user_id bigint, bot_id uuid, coupon_id uuid, activated_at timestamptz DEFAULT now(), created_at timestamptz DEFAULT now());
-CREATE TABLE IF NOT EXISTS webhook_logs (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), source text, payload jsonb, status text, created_at timestamptz DEFAULT now());
-CREATE OR REPLACE VIEW user_languages AS SELECT * FROM user_language_preferences;
+#!/usr/bin/env python3
+"""Migrate ALL missing tables from old to new Supabase"""
+import json, time, re, copy
+from supabase import create_client
+
+OLD_URL = "https://qiqbfbcxlmsvtyenhwac.supabase.co"
+OLD_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFpcWJmYmN4bG1zdnR5ZW5od2FjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjkyNzkwNjIsImV4cCI6MjA4NDg1NTA2Mn0.2WaMQQTLzh747jQWk1ChAuMJbvpubgnAZir-Vq0GOOE"
+
+NEW_URL = "https://kosmdtcrrklaalfyxmlc.supabase.co"
+NEW_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imtvc21kdGNycmtsYWFsZnl4bWxjIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3OTY0NDc2MywiZXhwIjoyMDk1MjIwNzYzfQ.cpyAuoLRASuypLyG7c37rOi25hAA5QoN-Au5KmWRHp0"
+
+old = create_client(OLD_URL, OLD_KEY)
+new = create_client(NEW_URL, NEW_KEY)
+
+# ALL tables to migrate (missing + re-import with pagination)
+TABLES = [
+    'app_settings',
+    'banned_users',
+    'bot_translations',
+    'coupon_activations',
+    'generator_bots',
+    'gifts',
+    'link_generation_logs',
+    'manual_payment_methods',
+    'payment_method_assignments',
+    'pending_purchases',
+    'subscriptions',
+    'user_active_coupons',
+    'webhook_logs',
+    # Re-import these (were incomplete or wrong table name)
+    'user_language_preferences',
+    'invite_codes',
+    'sales',
+]
+
+print("=" * 50)
+print("STEP 1: EXPORT FROM OLD SUPABASE")
+print("=" * 50)
+
+exported = {}
+for t in TABLES:
+    try:
+        # Paginate to get ALL rows (default limit is 1000)
+        all_rows = []
+        offset = 0
+        batch_size = 1000
+        while True:
+            r = old.table(t).select('*').range(offset, offset + batch_size - 1).execute()
+            rows = r.data or []
+            all_rows.extend(rows)
+            if len(rows) < batch_size:
+                break
+            offset += batch_size
+        exported[t] = all_rows
+        print(f"  ✅ {t}: {len(all_rows)} rows")
+    except Exception as e:
+        print(f"  ❌ {t}: {e}")
+        exported[t] = []
+
+# Save backup
+with open('/tmp/supabase_backup_v2.json', 'w') as f:
+    json.dump(exported, f, default=str)
+
+print(f"\nTotal: {sum(len(v) for v in exported.values())} rows")
+
+print("\n" + "=" * 50)
+print("STEP 2: IMPORT TO NEW SUPABASE")
+print("=" * 50)
+
+for t in TABLES:
+    data = exported.get(t, [])
+    if not data:
+        print(f"  ⏭️  {t}: empty")
+        continue
+    
+    # Find bad columns
+    bad_cols = set()
+    test_row = copy.deepcopy(data[0])
+    
+    for attempt in range(20):
+        for bc in bad_cols:
+            test_row.pop(bc, None)
+        try:
+            new.table(t).upsert(test_row).execute()
+            break
+        except Exception as e:
+            err_msg = str(e)
+            match = re.search(r"Could not find the '(\w+)' column", err_msg)
+            if match:
+                bad_cols.add(match.group(1))
+                continue
+            elif "duplicate key" in err_msg or "unique" in err_msg.lower() or "already exists" in err_msg.lower():
+                break
+            else:
+                print(f"    ⚠️  {t} first row: {err_msg[:120]}")
+                break
+    
+    if bad_cols:
+        print(f"  🔧 {t}: stripping {bad_cols}")
+    
+    success = 1  # first row already imported
+    failed = 0
+    
+    for row in data[1:]:
+        clean = {k: v for k, v in row.items() if k not in bad_cols}
+        try:
+            new.table(t).upsert(clean).execute()
+            success += 1
+        except Exception as e:
+            err_msg = str(e)
+            match = re.search(r"Could not find the '(\w+)' column", err_msg)
+            if match:
+                bad_cols.add(match.group(1))
+                clean = {k: v for k, v in row.items() if k not in bad_cols}
+                try:
+                    new.table(t).upsert(clean).execute()
+                    success += 1
+                    continue
+                except:
+                    pass
+            failed += 1
+            if failed <= 2:
+                print(f"    ❌ {err_msg[:120]}")
+    
+    print(f"  ✅ {t}: {success} imported, {failed} failed")
+    time.sleep(0.3)
+
+print("\n✅ ALL DONE!")
