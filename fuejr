@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""Migrate storage files from old to new Supabase"""
+import requests, json, os
+
+OLD_URL = "https://qiqbfbcxlmsvtyenhwac.supabase.co"
+OLD_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFpcWJmYmN4bG1zdnR5ZW5od2FjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjkyNzkwNjIsImV4cCI6MjA4NDg1NTA2Mn0.2WaMQQTLzh747jQWk1ChAuMJbvpubgnAZir-Vq0GOOE"
+
+NEW_URL = "https://kosmdtcrrklaalfyxmlc.supabase.co"
+NEW_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imtvc21kdGNycmtsYWFsZnl4bWxjIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3OTY0NDc2MywiZXhwIjoyMDk1MjIwNzYzfQ.cpyAuoLRASuypLyG7c37rOi25hAA5QoN-Au5KmWRHp0"
+
+old_h = {"apikey": OLD_KEY, "Authorization": f"Bearer {OLD_KEY}"}
+new_h = {"apikey": NEW_KEY, "Authorization": f"Bearer {NEW_KEY}"}
+
+# List buckets
+print("Listing buckets...")
+r = requests.get(f"{OLD_URL}/storage/v1/bucket", headers=old_h)
+if r.status_code != 200:
+    print(f"Error listing buckets: {r.status_code} {r.text}")
+    exit(1)
+
+buckets = r.json()
+print(f"Found {len(buckets)} buckets")
+
+for bucket in buckets:
+    bname = bucket['name']
+    print(f"\n📁 Bucket: {bname}")
+    
+    # Create bucket in new
+    requests.post(f"{NEW_URL}/storage/v1/bucket", headers=new_h, json={
+        "id": bname, "name": bname, "public": bucket.get('public', True)
+    })
+    
+    # List files
+    r = requests.post(f"{OLD_URL}/storage/v1/object/list/{bname}", 
+        headers=old_h, json={"prefix": "", "limit": 1000})
+    
+    if r.status_code != 200:
+        print(f"  Error listing: {r.text[:100]}")
+        continue
+    
+    files = r.json()
+    print(f"  {len(files)} files")
+    
+    for f in files:
+        fname = f['name']
+        if f.get('metadata') is None and not fname:
+            continue
+        
+        # Download
+        dr = requests.get(f"{OLD_URL}/storage/v1/object/{bname}/{fname}", headers=old_h)
+        if dr.status_code != 200:
+            # Try public URL
+            dr = requests.get(f"{OLD_URL}/storage/v1/object/public/{bname}/{fname}")
+        
+        if dr.status_code == 200:
+            # Upload to new
+            ct = dr.headers.get('content-type', 'application/octet-stream')
+            up = requests.post(
+                f"{NEW_URL}/storage/v1/object/{bname}/{fname}",
+                headers={**new_h, "Content-Type": ct},
+                data=dr.content
+            )
+            if up.status_code in (200, 201):
+                print(f"  ✅ {fname}")
+            else:
+                # Try upsert
+                up = requests.put(
+                    f"{NEW_URL}/storage/v1/object/{bname}/{fname}",
+                    headers={**new_h, "Content-Type": ct},
+                    data=dr.content
+                )
+                if up.status_code in (200, 201):
+                    print(f"  ✅ {fname}")
+                else:
+                    print(f"  ❌ {fname}: {up.status_code}")
+        else:
+            print(f"  ❌ {fname}: download failed {dr.status_code}")
+
+print("\n✅ Storage migration done!")
